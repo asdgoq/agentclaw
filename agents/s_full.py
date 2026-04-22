@@ -49,6 +49,9 @@ s12（任务感知 worktree 隔离）单独讲授。
     team.py        - 队友管理器（s09/s11）
     session.py     - 树形 JSONL 会话管理器
     search.py      - SQLite FTS5 全文搜索索引（含 jieba 中文分词）
+    memory.py      - 长期记忆库（JSONL，用户驱动的增删查）
+    worktree.py     - Git Worktree 管理器（子代理隔离环境）
+    planner.py      - 任务规划器（分解、派发、监控代码库健康度）
 
 存储架构：
     JSONL (.jsonl)  → 主存储：树形结构、分支、压缩
@@ -56,6 +59,7 @@ s12（任务感知 worktree 隔离）单独讲授。
 
 REPL 命令：/compact /tasks /team /inbox /session_list /session_switch
             /session_new /session_history /session_branch /session_search
+            /memory [/category]
 
 直接运行：
     python agents/s_full.py
@@ -97,16 +101,22 @@ from agents.background import BackgroundManager
 from agents.compression import estimate_tokens, microcompact, auto_compact
 from agents.config import (WORKDIR, TOKEN_THRESHOLD, PROVIDER, MODEL,
                            SKILLS_DIR)
-from agents.llm import call_llm, parse_llm_response
+from agents.llm import stream_call_llm
 from agents.messaging import (MessageBus, handle_shutdown_request,
                                handle_plan_review)
 from agents.session import SessionManager
 from agents.skills import SkillLoader
-from agents.subagent import run_subagent
+from agents.subagent import run_subagent, run_git_worker
 from agents.tasks import TaskManager
 from agents.team import TeammateManager
 from agents.todos import TodoManager
 from agents.tools import run_bash, run_read, run_write, run_edit
+from agents.memory import MemoryBank, CATEGORIES
+from agents.git import (
+    git_status, git_branch, git_branch_create, git_branch_checkout,
+    git_commit, git_diff, git_log, git_pr,
+)
+from agents.planner import PLANNER
 
 # === Global Instances ===
 TODO = TodoManager()
@@ -119,12 +129,51 @@ TEAM = TeammateManager(BUS, TASK_MGR)
 # Session Manager (tree JSONL)
 SESSION = SessionManager.continue_recent()
 
+# Long-term memory bank
+MEMORY = MemoryBank()
+
+# Task planner (singleton)
+PLANNER_INST = PLANNER
+
 
 # === System Prompt ===
+_memory_text = MEMORY.recall_for_prompt()
 SYSTEM = f"""你是一个在 {WORKDIR} 工作的编程助手。使用工具来完成任务。
 多步骤工作优先使用 task_create/task_update/task_list。简短清单用 TodoWrite。
 用 task 调度子代理。用 load_skill 加载专业知识。
-可用技能：{SKILLS.descriptions()}"""
+可用技能：{SKILLS.descriptions()}
+{_memory_text}
+
+## 自主决策规则（重要！）
+
+你不需要等待用户命令，遇到以下情况应自主决策并执行：
+
+1. **复杂任务 → 自动走 Planner 流程**
+   当用户的目标涉及多个文件、多个模块、或明显可拆分为独立子任务时，
+   立即调用 `planner_execute` 工具，让 Planner 自动分解任务、派发 Git Worker 并行执行、收集结果。
+   不需要问用户"要不要用 planner"，直接用。
+
+   判断标准：
+   - 目标涉及 ≥2 个文件的修改
+   - 目标包含多个独立功能点
+   - 用户说"实现 XXX 功能"、"重构 XXX 模块"、"添加 XXX 系统"
+   - 任务预估需要多次 commit
+
+2. **单文件/简单任务 → 直接做或用 git_worker**
+   如果是单一文件的修改、单个 bug fix、小功能，直接自己写代码 + git_commit 即可。
+   如果需要隔离环境（避免影响当前工作区），用 `git_worker` 派发一个子代理。
+
+3. **不需要用户确认的环节**
+   - 不需要问"要不要开始"
+   - 不需要问"要不要创建分支"
+   - 不需要问"要不要提交"
+   - 不需要问"要不要用 planner"
+   - 这些你都自己决定
+
+输出要求：
+- 直接输出内容，不要使用任何装饰性格式（如横线、边框、分隔线、emoji 装饰等）
+- 不要用 ┌─┐ │ └─┘ 等 Unicode 制表符画框
+- 回答简洁明了，不要过度格式化"""
 
 
 # === Tool Definitions ===
@@ -160,6 +209,23 @@ TOOL_HANDLERS = {
     "session_switch":   lambda **kw: _do_session_switch(kw.get("selection")),
     "session_search":    lambda **kw: _do_session_search(kw.get("query"), kw.get("global", False), kw.get("limit", 20)),
     "session_search_stats": lambda **kw: _format_search_stats(),
+    # Git tools
+    "git_status":        lambda **kw: git_status(),
+    "git_branch":        lambda **kw: git_branch(kw.get("list_all", False)),
+    "git_branch_create":  lambda **kw: git_branch_create(kw["name"], kw.get("from_ref", "HEAD")),
+    "git_branch_checkout": lambda **kw: git_branch_checkout(kw["name"]),
+    "git_commit":        lambda **kw: git_commit(kw["message"], kw.get("add", True), kw.get("files", ".")),
+    "git_diff":          lambda **kw: git_diff(kw.get("staged", False), kw.get("file", "")),
+    "git_log":           lambda **kw: git_log(kw.get("max_count", 10), kw.get("oneline", True)),
+    "git_pr":            lambda **kw: git_pr(
+                               kw.get("title", ""), kw.get("body", ""),
+                               kw.get("base", "main"), kw.get("draft", False)),
+    # Git Worker (full workflow subagent)
+    "git_worker":        lambda **kw: run_git_worker(kw["task"], kw.get("base_branch", "main")),
+    # Planner tools
+    "planner_plan":       lambda **kw: PLANNER_INST.decompose(kw["goal"]),
+    "planner_execute":    lambda **kw: PLANNER_INST.plan_and_execute(kw["goal"]),
+    "planner_status":     lambda **kw: PLANNER_INST.get_status(),
 }
 
 TOOLS = [
@@ -226,7 +292,81 @@ TOOLS = [
      }, "required": ["query"]}},
     {"name": "session_search_stats", "description": "显示搜索索引的统计信息（总条目数、已索引会话数、数据库大小等）。",
      "input_schema": {"type": "object", "properties": {}}},
+    # Git tools
+    {"name": "git_status", "description": "查看 Git 工作区状态（已修改/已暂存/未跟踪文件等）。自动检测是否在 Git 仓库内。",
+     "input_schema": {"type": "object", "properties": {}}},
+    {"name": "git_branch", "description": "列出所有本地分支，当前分支标记为 *。显示每个分支的最新 commit 信息。",
+     "input_schema": {"type": "object", "properties": {
+         "list_all": {"type": "boolean", "description": "是否包含远程分支（暂未实现，固定为本地分支）"}
+     }}},
+    {"name": "git_branch_create", "description": "创建新分支并切换到它。相当于 git checkout -b <name> [<from_ref>]。from_ref 默认为 HEAD。",
+     "input_schema": {"type": "object", "properties": {
+         "name": {"type": "string", "description": "新分支名"},
+         "from_ref": {"type": "string", "description": "基于哪个 ref 创建（默认 HEAD）"}
+     }, "required": ["name"]}},
+    {"name": "git_branch_checkout", "description": "切换到已有的分支。相当于 git checkout <name>。",
+     "input_schema": {"type": "object", "properties": {
+         "name": {"type": "string", "description": "要切换到的目标分支名"}
+     }, "required": ["name"]}},
+    {"name": "git_commit", "description": "提交更改到 Git。先自动 git add（可通过 add=False 关闭），然后 git commit。返回 commit hash 和变更统计。",
+     "input_schema": {"type": "object", "properties": {
+         "message": {"type": "string", "description": "commit message（必填）"},
+         "add": {"type": "boolean", "description": "是否先执行 git add（默认 true）"},
+         "files": {"type": "string", "description": "要暂存的文件或路径（默认 '.' 全部）"}
+     }, "required": ["message"]}},
+    {"name": "git_diff", "description": "查看代码差异。staged=True 查看已暂存的差异(--cached)，否则查看未暂存的差异。可指定具体文件路径。",
+     "input_schema": {"type": "object", "properties": {
+         "staged": {"type": "boolean", "description": "查看已暂存区的差异（--cached）"},
+         "file": {"type": "string", "description": "只看某个文件的差异"}
+     }}},
+    {"name": "git_log", "description": "查看 Git 提交历史。默认显示最近 10 条，每条一行(--oneline)，含分支标签。",
+     "input_schema": {"type": "object", "properties": {
+         "max_count": {"type": "integer", "description": "显示条数（默认 10）"},
+         "oneline": {"type": "boolean", "description": "每条显示为一行（默认 true）"}
+     }}},
+    {"name": "git_pr", "description": "使用 gh CLI 创建 GitHub Pull Request。自动 push 当前分支到远程后用 gh pr create 创建 PR。需要 gh CLI 已安装并登录。不在 main/master 上时可用。工作区有未提交更改时会拒绝操作。",
+     "input_schema": {"type": "object", "properties": {
+         "title": {"type": "string", "description": "PR 标题（留空则用最后一条 commit message）"},
+         "body": {"type": "string", "description": "PR 描述内容"},
+         "base": {"type": "string", "description": "目标分支（默认 main）"},
+         "draft": {"type": "boolean", "description": "是否创建为 draft PR（默认 false）"}
+     }}},
+    {"name": "git_worker", "description": "启动一个 Git 工作流子代理，自动完成「创建分支 -> 写代码 -> commit -> 合并到 master」的全流程。子代理会自动处理冲突、运行测试、生成有意义的 commit message。适用于需要完整实现功能的任务。",
+     "input_schema": {"type": "object", "properties": {
+         "task": {"type": "string", "description": "任务描述，说明要做什么功能或修复什么 bug（必填）"},
+         "base_branch": {"type": "string", "description": "合并到的目标分支（默认 main）"}
+     }, "required": ["task"]}},
+    {"name": "planner_plan", "description": "将复杂目标分解为可并行的子任务。返回 JSON 格式的任务列表，包含每个任务的 ID、描述、依赖关系和优先级。适用于大功能开发前的规划。",
+     "input_schema": {"type": "object", "properties": {
+         "goal": {"type": "string", "description": "要分解的目标/需求（必填）"}
+     }, "required": ["goal"]}},
+    {"name": "planner_execute", "description": "完整执行「目标分解 -> 派发 Git Worker 子代理 -> 收集结果」的全流程。Planner 自动处理依赖关系、并行派发、监控执行状态。适用于让 AI 自主完成大型功能的开发和集成。",
+     "input_schema": {"type": "object", "properties": {
+         "goal": {"type": "string", "description": "要实现的目标/需求（必填）"}
+     }, "required": ["goal"]}},
+    {"name": "planner_status", "description": "查看 Planner 的历史执行记录和统计信息。",
+     "input_schema": {"type": "object", "properties": {}}},
 ]
+
+
+# === Output Formatting ===
+
+def _format_tool_output(output, max_len: int = 300) -> str:
+    """格式化工具输出：压缩 JSON、截断长文本、去掉多余空白。"""
+    text = str(output)
+    # 尝试美化 JSON（如果是 JSON 字符串则压缩显示）
+    text_stripped = text.strip()
+    if text_stripped.startswith('{') or text_stripped.startswith('['):
+        try:
+            obj = json.loads(text_stripped)
+            # 压缩为一行，避免大 JSON 占满屏幕
+            text = json.dumps(obj, ensure_ascii=False, separators=(',', ':'))
+        except (json.JSONDecodeError, ValueError):
+            pass
+    # 截断过长输出
+    if len(text) > max_len:
+        text = text[:max_len] + f"... (共 {len(text)} 字符)"
+    return text
 
 
 # === Session-aware helpers ===
@@ -639,21 +779,25 @@ def agent_loop(messages: list):
         inbox = BUS.read_inbox("lead")
         if inbox:
             messages.append({"role": "user", "content": f"<inbox>{json.dumps(inbox, indent=2)}</inbox>"})
-        # LLM call
-        response = call_llm(
+        # LLM streaming call — print text as it arrives
+        response = None
+        for chunk, evt, data in stream_call_llm(
             system=SYSTEM, messages=messages,
             tools=TOOLS, max_tokens=8000,
-        )
-        response = parse_llm_response(response)
+        ):
+            if evt == "text_delta":
+                # Stream text to terminal in real-time
+                print(chunk, end="", flush=True)
+            elif evt == "done":
+                response = data
+
+        if response is None:
+            return  # should not happen, but safety guard
+
         messages.append({"role": "assistant", "content": response.content})
 
         # Persist to session (tree JSONL)
         if response.content:
-            for block in response.content:
-                if hasattr(block, 'text') and block.type == "text":
-                    pass
-                elif hasattr(block, 'type') and block.type == "tool_use":
-                    pass
             try:
                 SESSION.append_message({"role": "assistant", "content": response.content})
             except Exception:
@@ -674,8 +818,7 @@ def agent_loop(messages: list):
                     output = handler(**block.input) if handler else f"未知工具： {block.name}"
                 except Exception as e:
                     output = f"错误：{e}"
-                print(f"> {block.name}:")
-                print(str(output)[:200])
+                print(f"> {block.name}: {_format_tool_output(output)}")
                 results.append({"type": "tool_result", "tool_use_id": block.id, "content": str(output)})
                 if block.name == "TodoWrite":
                     used_todo = True
@@ -777,20 +920,103 @@ if __name__ == "__main__":
             print(_do_session_search())
             continue
 
-        # Normal user input -> append to session + run agent loop
+        # --- Memory commands (user-only, NOT LLM tools) ---
+        if cmd.startswith("/memory"):
+            parts = cmd.strip().split(maxsplit=2)
+            subcmd = parts[1] if len(parts) > 1 else None
+            subarg = parts[2] if len(parts) > 2 else None
+
+            if not subcmd or subcmd == "list":
+                cat = subarg.strip() if subarg else None
+                print(MEMORY.list_all(category=cat))
+
+            elif subcmd == "push" or subcmd == "record" or subcmd == "add":
+                if not subarg:
+                    print("用法：/memory push <category> <内容>\n"
+                          f"可用分类：{', '.join(CATEGORIES)}\n"
+                          "示例：/memory push preference 我喜欢 Rust 不喜欢 Go")
+                    continue
+                mem_parts = subarg.split(maxsplit=1)
+                if len(mem_parts) < 2:
+                    print(f"错误：需要指定分类和内容。用法：/memory push <分类> <内容>")
+                    continue
+                cat, content = mem_parts[0], mem_parts[1]
+                result = MEMORY.remember(cat, content)
+                print(result)
+
+            elif subcmd == "delete" or subcmd == "del" or subcmd == "rm":
+                if not subarg:
+                    print("用法：/memory delete <ID>\n先用 /memory list 查看记忆 ID")
+                    continue
+                print(MEMORY.delete(subarg.strip()))
+
+            elif subcmd in ("stats", "stat", "info"):
+                cats = MEMORY.categories
+                print(f"┌────────────────────────────┐")
+                print(f"│     长期记忆统计              │")
+                print(f"└────────────────────────────┘")
+                print(f"  总条目数：  {MEMORY.count}")
+                print(f"  分类：      {', '.join(cats) if cats else '(无)'}")
+                print(f"  文件：      {MEMORY._filepath}")
+
+            elif subcmd == "help":
+                print(
+                    "长期记忆命令（用户直接操作，非 LLM）：\n"
+                    "  /memory list [category]   列出记忆，可按分类过滤\n"
+                    "  /memory push <cat> <内容> 存一条新记忆\n"
+                    "  /memory del <ID>           按 ID 删除\n"
+                    "  /memory stats              统计信息\n"
+                    f"\n可用分类：{', '.join(CATEGORIES)}"
+                )
+            else:
+                print(f"未知命令 '{subcmd}'。输入 /memory help 查看帮助。")
+            continue
+
+        # --- Planner commands ---
+        if cmd.startswith("/plan"):
+            parts = cmd.strip().split(maxsplit=1)
+            goal = parts[1] if len(parts) > 1 else None
+            if not goal:
+                print(
+                    "任务规划器命令：\n"
+                    "  /plan <目标>              分解目标并执行完整流程\n"
+                    "  /plan decompose <目标>    仅分解任务，不执行\n"
+                    "  /plan status             查看历史记录\n"
+                    "  /plan help               显示帮助\n"
+                    "\n示例：\n"
+                    "  /plan 给项目添加完整的错误处理和日志系统\n"
+                    "  /plan decompose 实现用户认证模块"
+                )
+                continue
+            if goal.lower() == "status":
+                print(PLANNER_INST.get_status())
+            elif goal.lower().startswith("decompose "):
+                sub_goal = goal[len("decompose "):].strip()
+                tasks = PLANNER_INST.decompose(sub_goal)
+                import json as _json
+                print(_json.dumps(tasks, ensure_ascii=False, indent=2))
+            elif goal.lower() == "help":
+                print(
+                    "任务规划器 — 自主分解任务、派发 Worker、监控结果\n"
+                    "\n命令：\n"
+                    "  /plan <目标>              完整流程：分解→派发→监控→报告\n"
+                    "  /plan decompose <目标>    仅查看分解结果（JSON）\n"
+                    "  /plan status             历史执行记录\n"
+                    "\n工作原理：\n"
+                    "  1. LLM 将目标拆分为可并行的子任务\n"
+                    "  2. 每个子任务派发给一个 Git Worker（独立 worktree）\n"
+                    "  3. Worker 自行处理冲突、编译错误等\n"
+                    "  4. Planner 汇总所有结果，发现遗留问题"
+                )
+            else:
+                # Full plan and execute
+                result = PLANNER_INST.plan_and_execute(goal)
+                print(result)
+            continue
+
+        # Normal user input -> append to session + run agent loop (streaming)
         SESSION.append_message({"role": "user", "content": query})
         agent_loop([{"role": "user", "content": query}])
-
-        # Print last response
-        ctx = SESSION.build_context()
-        if ctx["messages"]:
-            last = ctx["messages"][-1]
-            if isinstance(last, dict) and last.get("role") == "assistant":
-                content = last.get("content", "")
-                if isinstance(content, list):
-                    for block in content:
-                        if hasattr(block, "text"):
-                            print(block.text)
-                elif isinstance(content, str):
-                    print(content)
+        # Note: text is already printed in real-time by stream_call_llm
+        # No need to re-print here — just add a blank line for spacing
         print()
