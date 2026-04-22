@@ -46,16 +46,25 @@ import uuid
 from pathlib import Path
 from queue import Queue
 
-from anthropic import Anthropic
 from dotenv import load_dotenv
 
 load_dotenv(override=True)
-if os.getenv("ANTHROPIC_BASE_URL"):
-    os.environ.pop("ANTHROPIC_AUTH_TOKEN", None)
+
+# Provider selection: "anthropic" or "glm"
+PROVIDER = os.getenv("PROVIDER", "glm")
+
+if PROVIDER == "glm":
+    from zai import ZhipuAiClient
+    client = ZhipuAiClient(api_key=os.getenv("GLM_API_KEY"))
+    MODEL = os.getenv("MODEL_ID", "glm-5")
+else:
+    from anthropic import Anthropic
+    if os.getenv("ANTHROPIC_BASE_URL"):
+        os.environ.pop("ANTHROPIC_AUTH_TOKEN", None)
+    client = Anthropic(base_url=os.getenv("ANTHROPIC_BASE_URL"))
+    MODEL = os.environ["MODEL_ID"]
 
 WORKDIR = Path.cwd()
-client = Anthropic(base_url=os.getenv("ANTHROPIC_BASE_URL"))
-MODEL = os.environ["MODEL_ID"]
 
 TEAM_DIR = WORKDIR / ".team"
 INBOX_DIR = TEAM_DIR / "inbox"
@@ -68,6 +77,120 @@ IDLE_TIMEOUT = 60
 
 VALID_MSG_TYPES = {"message", "broadcast", "shutdown_request",
                    "shutdown_response", "plan_approval_response"}
+
+
+# === SECTION: LLM abstraction layer ===
+def call_llm(messages: list, tools: list = None, system: str = None, max_tokens: int = 8000):
+    """统一的 LLM 调用接口，支持 Anthropic 和 GLM"""
+    if PROVIDER == "glm":
+        # GLM 使用 zai-sdk
+        glm_messages = []
+        if system:
+            glm_messages.append({"role": "system", "content": system})
+        for msg in messages:
+            role = msg.get("role", "user")
+            content = msg.get("content", "")
+            # 处理 content 是 list 的情况
+            if isinstance(content, list):
+                text_parts = []
+                for part in content:
+                    if isinstance(part, dict):
+                        if part.get("type") == "text":
+                            text_parts.append(part.get("text", ""))
+                        elif part.get("type") == "tool_result":
+                            text_parts.append(f"[Tool Result: {part.get('tool_use_id', '')}] {part.get('content', '')}")
+                    elif isinstance(part, str):
+                        text_parts.append(part)
+                content = "\n".join(text_parts)
+            glm_messages.append({"role": role, "content": str(content)})
+
+        # GLM 调用
+        kwargs = {
+            "model": MODEL,
+            "messages": glm_messages,
+            "max_tokens": max_tokens,
+        }
+        if tools:
+            # 转换 tools 格式
+            glm_tools = []
+            for t in tools:
+                glm_tools.append({
+                    "type": "function",
+                    "function": {
+                        "name": t["name"],
+                        "description": t.get("description", ""),
+                        "parameters": t.get("input_schema", {})
+                    }
+                })
+            kwargs["tools"] = glm_tools
+
+        return client.chat.completions.create(**kwargs)
+    else:
+        # Anthropic 调用
+        kwargs = {
+            "model": MODEL,
+            "messages": messages,
+            "max_tokens": max_tokens,
+        }
+        if tools:
+            kwargs["tools"] = tools
+        if system:
+            kwargs["system"] = system
+        return client.messages.create(**kwargs)
+
+
+class ParsedToolUse:
+    """解析后的工具调用块"""
+    def __init__(self, tool_id, name, arguments):
+        self.type = "tool_use"
+        self.id = tool_id
+        self.name = name
+        self.input = arguments
+
+
+class ParsedText:
+    """解析后的文本块"""
+    def __init__(self, text):
+        self.type = "text"
+        self.text = text
+
+
+class ParsedResponse:
+    """解析后的响应"""
+    def __init__(self):
+        self.content = []
+        self.stop_reason = "end_turn"
+
+
+def parse_llm_response(response):
+    """解析 LLM 响应，返回统一格式"""
+    if PROVIDER == "glm":
+        # GLM 响应解析
+        choice = response.choices[0]
+        message = choice.message
+
+        parsed = ParsedResponse()
+        parsed.stop_reason = "end_turn" if choice.finish_reason == "stop" else "tool_use"
+
+        # 处理文本内容
+        if hasattr(message, "content") and message.content:
+            parsed.content.append(ParsedText(message.content))
+
+        # 处理工具调用
+        if hasattr(message, "tool_calls") and message.tool_calls:
+            for tc in message.tool_calls:
+                args = tc.function.arguments
+                if isinstance(args, str):
+                    try:
+                        args = json.loads(args)
+                    except:
+                        args = {}
+                parsed.content.append(ParsedToolUse(tc.id, tc.function.name, args))
+            parsed.stop_reason = "tool_use"
+
+        return parsed
+    else:
+        return response
 
 
 # === SECTION: base_tools ===
@@ -180,7 +303,8 @@ def run_subagent(prompt: str, agent_type: str = "Explore") -> str:
     sub_msgs = [{"role": "user", "content": prompt}]
     resp = None
     for _ in range(30):
-        resp = client.messages.create(model=MODEL, messages=sub_msgs, tools=sub_tools, max_tokens=8000)
+        resp = call_llm(messages=sub_msgs, tools=sub_tools, max_tokens=8000)
+        resp = parse_llm_response(resp)
         sub_msgs.append({"role": "assistant", "content": resp.content})
         if resp.stop_reason != "tool_use":
             break
@@ -247,12 +371,12 @@ def auto_compact(messages: list) -> list:
         for msg in messages:
             f.write(json.dumps(msg, default=str) + "\n")
     conv_text = json.dumps(messages, default=str)[-80000:]
-    resp = client.messages.create(
-        model=MODEL,
+    resp = call_llm(
         messages=[{"role": "user", "content": f"Summarize for continuity:\n{conv_text}"}],
         max_tokens=2000,
     )
-    summary = resp.content[0].text
+    resp = parse_llm_response(resp)
+    summary = resp.content[0].text if resp.content else "(summary failed)"
     return [
         {"role": "user", "content": f"[Compressed. Transcript: {path}]\n{summary}"},
     ]
@@ -462,9 +586,10 @@ class TeammateManager:
                         return
                     messages.append({"role": "user", "content": json.dumps(msg)})
                 try:
-                    response = client.messages.create(
-                        model=MODEL, system=sys_prompt, messages=messages,
+                    response = call_llm(
+                        system=sys_prompt, messages=messages,
                         tools=tools, max_tokens=8000)
+                    response = parse_llm_response(response)
                 except Exception:
                     self._set_status(name, "shutdown")
                     return
@@ -669,10 +794,11 @@ def agent_loop(messages: list):
         if inbox:
             messages.append({"role": "user", "content": f"<inbox>{json.dumps(inbox, indent=2)}</inbox>"})
         # LLM call
-        response = client.messages.create(
-            model=MODEL, system=SYSTEM, messages=messages,
+        response = call_llm(
+            system=SYSTEM, messages=messages,
             tools=TOOLS, max_tokens=8000,
         )
+        response = parse_llm_response(response)
         messages.append({"role": "assistant", "content": response.content})
         if response.stop_reason != "tool_use":
             return
