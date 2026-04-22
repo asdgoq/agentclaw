@@ -1,24 +1,24 @@
 #!/usr/bin/env python3
-# Harness: all mechanisms combined -- the complete cockpit for the model.
+# 总控：所有机制合一 —— 模型的完整驾驶舱
 """
-s_full.py - Full Reference Agent
+s_full.py - 完整参考 Agent（模块化版本）
 
-Capstone implementation combining every mechanism from s01-s11.
-Session s12 (task-aware worktree isolation) is taught separately.
-NOT a teaching session -- this is the "put it all together" reference.
+综合 s01-s11 所有机制的集大成实现。
+s12（任务感知 worktree 隔离）单独讲授。
+这不是教学会话 —— 这是「全部整合」的参考实现。
 
     +------------------------------------------------------------------+
-    |                        FULL AGENT                                 |
+    |                        完 整 Agent                              |
     |                                                                   |
-    |  System prompt (s05 skills, task-first + optional todo nag)      |
+    |  系统提示词（s05 技能、任务优先 + 可选 todo 提醒）         |
     |                                                                   |
-    |  Before each LLM call:                                            |
+    |  每次 LLM 调用前：                                              |
     |  +--------------------+  +------------------+  +--------------+  |
-    |  | Microcompact (s06) |  | Drain bg (s08)   |  | Check inbox  |  |
-    |  | Auto-compact (s06) |  | notifications    |  | (s09)        |  |
+    |  | 微压缩 (s06)      |  | 排空后台(s08)   |  | 检查收件箱 |  |
+    |  | 自动压缩 (s06)    |  | 通知             |  | (s09)       |  |
     |  +--------------------+  +------------------+  +--------------+  |
     |                                                                   |
-    |  Tool dispatch (s02 pattern):                                     |
+    |  工具调度（s02 模式）：                                         |
     |  +--------+----------+----------+---------+-----------+          |
     |  | bash   | read     | write    | edit    | TodoWrite |          |
     |  | task   | load_sk  | compress | bg_run  | bg_check  |          |
@@ -27,646 +27,88 @@ NOT a teaching session -- this is the "put it all together" reference.
     |  | plan   | idle     | claim    |         |           |          |
     |  +--------+----------+----------+---------+-----------+          |
     |                                                                   |
-    |  Subagent (s04):  spawn -> work -> return summary                 |
-    |  Teammate (s09):  spawn -> work -> idle -> auto-claim (s11)      |
-    |  Shutdown (s10):  request_id handshake                            |
-    |  Plan gate (s10): submit -> approve/reject                        |
+    |  子代理 (s04)：  生成 -> 执行 -> 返回摘要                        |
+    |  队友 (s09)：    生成 -> 执行 -> 空闲 -> 自动认领(s11)        |
+    |  关闭 (s10)：    request_id 握手协议                             |
+    |  计划审批(s10)：提交 -> 审批/驳回                           |
+    |                                                                   |
+    |  会话（树形 JSONL）：分支 / 压缩 / 持久化                 |
     +------------------------------------------------------------------+
 
-    REPL commands: /compact /tasks /team /inbox
+模块说明：
+    config.py      - 全局配置、Provider 初始化、常量
+    llm.py         - LLM 抽象层（call_llm, parse_llm_response）
+    tools.py       - 基础工具（bash, read, write, edit）
+    todos.py       - TodoManager（s03）
+    subagent.py    - 子代理生成（s04）
+    skills.py      - 技能加载器（s05）
+    compression.py - 上下文压缩（s06）
+    tasks.py       - 任务管理器（s07）
+    background.py  - 后台任务管理器（s08）
+    messaging.py   - 消息总线 + 关闭/计划协议（s09/s10）
+    team.py        - 队友管理器（s09/s11）
+    session.py     - 树形 JSONL 会话管理器
+    search.py      - SQLite FTS5 全文搜索索引（含 jieba 中文分词）
+
+存储架构：
+    JSONL (.jsonl)  → 主存储：树形结构、分支、压缩
+    SQLite (.db)    → 搜索索引：FTS5 全文检索所有会话
+
+REPL 命令：/compact /tasks /team /inbox /session_list /session_switch
+            /session_new /session_history /session_branch /session_search
+
+直接运行：
+    python agents/s_full.py
+或作为模块：
+    python -m agents.s_full
 """
 
 import json
 import os
-import re
-import subprocess
-import threading
-import time
-import uuid
-from pathlib import Path
-from queue import Queue
-
-from dotenv import load_dotenv
-
-load_dotenv(override=True)
-
-# Provider selection: "anthropic" or "glm"
-PROVIDER = os.getenv("PROVIDER", "glm")
-
-if PROVIDER == "glm":
-    from zai import ZhipuAiClient
-    client = ZhipuAiClient(api_key=os.getenv("GLM_API_KEY"))
-    MODEL = os.getenv("MODEL_ID", "glm-5")
-else:
-    from anthropic import Anthropic
-    if os.getenv("ANTHROPIC_BASE_URL"):
-        os.environ.pop("ANTHROPIC_AUTH_TOKEN", None)
-    client = Anthropic(base_url=os.getenv("ANTHROPIC_BASE_URL"))
-    MODEL = os.environ["MODEL_ID"]
-
-WORKDIR = Path.cwd()
-
-TEAM_DIR = WORKDIR / ".team"
-INBOX_DIR = TEAM_DIR / "inbox"
-TASKS_DIR = WORKDIR / ".tasks"
-SKILLS_DIR = WORKDIR / "skills"
-TRANSCRIPT_DIR = WORKDIR / ".transcripts"
-TOKEN_THRESHOLD = 100000
-POLL_INTERVAL = 5
-IDLE_TIMEOUT = 60
-
-VALID_MSG_TYPES = {"message", "broadcast", "shutdown_request",
-                   "shutdown_response", "plan_approval_response"}
-
-
-# === SECTION: LLM abstraction layer ===
-def call_llm(messages: list, tools: list = None, system: str = None, max_tokens: int = 8000):
-    """统一的 LLM 调用接口，支持 Anthropic 和 GLM"""
-    if PROVIDER == "glm":
-        # GLM 使用 zai-sdk
-        glm_messages = []
-        if system:
-            glm_messages.append({"role": "system", "content": system})
-        for msg in messages:
-            role = msg.get("role", "user")
-            content = msg.get("content", "")
-            # 处理 content 是 list 的情况
-            if isinstance(content, list):
-                text_parts = []
-                for part in content:
-                    if isinstance(part, dict):
-                        if part.get("type") == "text":
-                            text_parts.append(part.get("text", ""))
-                        elif part.get("type") == "tool_result":
-                            text_parts.append(f"[Tool Result: {part.get('tool_use_id', '')}] {part.get('content', '')}")
-                    elif isinstance(part, str):
-                        text_parts.append(part)
-                content = "\n".join(text_parts)
-            glm_messages.append({"role": role, "content": str(content)})
-
-        # GLM 调用
-        kwargs = {
-            "model": MODEL,
-            "messages": glm_messages,
-            "max_tokens": max_tokens,
-        }
-        if tools:
-            # 转换 tools 格式
-            glm_tools = []
-            for t in tools:
-                glm_tools.append({
-                    "type": "function",
-                    "function": {
-                        "name": t["name"],
-                        "description": t.get("description", ""),
-                        "parameters": t.get("input_schema", {})
-                    }
-                })
-            kwargs["tools"] = glm_tools
-
-        return client.chat.completions.create(**kwargs)
-    else:
-        # Anthropic 调用
-        kwargs = {
-            "model": MODEL,
-            "messages": messages,
-            "max_tokens": max_tokens,
-        }
-        if tools:
-            kwargs["tools"] = tools
-        if system:
-            kwargs["system"] = system
-        return client.messages.create(**kwargs)
-
-
-class ParsedToolUse:
-    """解析后的工具调用块"""
-    def __init__(self, tool_id, name, arguments):
-        self.type = "tool_use"
-        self.id = tool_id
-        self.name = name
-        self.input = arguments
-
-
-class ParsedText:
-    """解析后的文本块"""
-    def __init__(self, text):
-        self.type = "text"
-        self.text = text
-
-
-class ParsedResponse:
-    """解析后的响应"""
-    def __init__(self):
-        self.content = []
-        self.stop_reason = "end_turn"
-
-
-def parse_llm_response(response):
-    """解析 LLM 响应，返回统一格式"""
-    if PROVIDER == "glm":
-        # GLM 响应解析
-        choice = response.choices[0]
-        message = choice.message
-
-        parsed = ParsedResponse()
-        parsed.stop_reason = "end_turn" if choice.finish_reason == "stop" else "tool_use"
-
-        # 处理文本内容
-        if hasattr(message, "content") and message.content:
-            parsed.content.append(ParsedText(message.content))
-
-        # 处理工具调用
-        if hasattr(message, "tool_calls") and message.tool_calls:
-            for tc in message.tool_calls:
-                args = tc.function.arguments
-                if isinstance(args, str):
-                    try:
-                        args = json.loads(args)
-                    except:
-                        args = {}
-                parsed.content.append(ParsedToolUse(tc.id, tc.function.name, args))
-            parsed.stop_reason = "tool_use"
-
-        return parsed
-    else:
-        return response
-
-
-# === SECTION: base_tools ===
-def safe_path(p: str) -> Path:
-    path = (WORKDIR / p).resolve()
-    if not path.is_relative_to(WORKDIR):
-        raise ValueError(f"Path escapes workspace: {p}")
-    return path
-
-def run_bash(command: str) -> str:
-    dangerous = ["rm -rf /", "sudo", "shutdown", "reboot", "> /dev/"]
-    if any(d in command for d in dangerous):
-        return "Error: Dangerous command blocked"
-    try:
-        r = subprocess.run(command, shell=True, cwd=WORKDIR,
-                           capture_output=True, text=True, timeout=120)
-        out = (r.stdout + r.stderr).strip()
-        return out[:50000] if out else "(no output)"
-    except subprocess.TimeoutExpired:
-        return "Error: Timeout (120s)"
-
-def run_read(path: str, limit: int = None) -> str:
-    try:
-        lines = safe_path(path).read_text().splitlines()
-        if limit and limit < len(lines):
-            lines = lines[:limit] + [f"... ({len(lines) - limit} more)"]
-        return "\n".join(lines)[:50000]
-    except Exception as e:
-        return f"Error: {e}"
-
-def run_write(path: str, content: str) -> str:
-    try:
-        fp = safe_path(path)
-        fp.parent.mkdir(parents=True, exist_ok=True)
-        fp.write_text(content)
-        return f"Wrote {len(content)} bytes to {path}"
-    except Exception as e:
-        return f"Error: {e}"
-
-def run_edit(path: str, old_text: str, new_text: str) -> str:
-    try:
-        fp = safe_path(path)
-        c = fp.read_text()
-        if old_text not in c:
-            return f"Error: Text not found in {path}"
-        fp.write_text(c.replace(old_text, new_text, 1))
-        return f"Edited {path}"
-    except Exception as e:
-        return f"Error: {e}"
-
-
-# === SECTION: todos (s03) ===
-class TodoManager:
-    def __init__(self):
-        self.items = []
-
-    def update(self, items: list) -> str:
-        validated, ip = [], 0
-        for i, item in enumerate(items):
-            content = str(item.get("content", "")).strip()
-            status = str(item.get("status", "pending")).lower()
-            af = str(item.get("activeForm", "")).strip()
-            if not content: raise ValueError(f"Item {i}: content required")
-            if status not in ("pending", "in_progress", "completed"):
-                raise ValueError(f"Item {i}: invalid status '{status}'")
-            if not af: raise ValueError(f"Item {i}: activeForm required")
-            if status == "in_progress": ip += 1
-            validated.append({"content": content, "status": status, "activeForm": af})
-        if len(validated) > 20: raise ValueError("Max 20 todos")
-        if ip > 1: raise ValueError("Only one in_progress allowed")
-        self.items = validated
-        return self.render()
-
-    def render(self) -> str:
-        if not self.items: return "No todos."
-        lines = []
-        for item in self.items:
-            m = {"completed": "[x]", "in_progress": "[>]", "pending": "[ ]"}.get(item["status"], "[?]")
-            suffix = f" <- {item['activeForm']}" if item["status"] == "in_progress" else ""
-            lines.append(f"{m} {item['content']}{suffix}")
-        done = sum(1 for t in self.items if t["status"] == "completed")
-        lines.append(f"\n({done}/{len(self.items)} completed)")
-        return "\n".join(lines)
-
-    def has_open_items(self) -> bool:
-        return any(item.get("status") != "completed" for item in self.items)
-
-
-# === SECTION: subagent (s04) ===
-def run_subagent(prompt: str, agent_type: str = "Explore") -> str:
-    sub_tools = [
-        {"name": "bash", "description": "Run command.",
-         "input_schema": {"type": "object", "properties": {"command": {"type": "string"}}, "required": ["command"]}},
-        {"name": "read_file", "description": "Read file.",
-         "input_schema": {"type": "object", "properties": {"path": {"type": "string"}}, "required": ["path"]}},
-    ]
-    if agent_type != "Explore":
-        sub_tools += [
-            {"name": "write_file", "description": "Write file.",
-             "input_schema": {"type": "object", "properties": {"path": {"type": "string"}, "content": {"type": "string"}}, "required": ["path", "content"]}},
-            {"name": "edit_file", "description": "Edit file.",
-             "input_schema": {"type": "object", "properties": {"path": {"type": "string"}, "old_text": {"type": "string"}, "new_text": {"type": "string"}}, "required": ["path", "old_text", "new_text"]}},
-        ]
-    sub_handlers = {
-        "bash": lambda **kw: run_bash(kw["command"]),
-        "read_file": lambda **kw: run_read(kw["path"]),
-        "write_file": lambda **kw: run_write(kw["path"], kw["content"]),
-        "edit_file": lambda **kw: run_edit(kw["path"], kw["old_text"], kw["new_text"]),
-    }
-    sub_msgs = [{"role": "user", "content": prompt}]
-    resp = None
-    for _ in range(30):
-        resp = call_llm(messages=sub_msgs, tools=sub_tools, max_tokens=8000)
-        resp = parse_llm_response(resp)
-        sub_msgs.append({"role": "assistant", "content": resp.content})
-        if resp.stop_reason != "tool_use":
-            break
-        results = []
-        for b in resp.content:
-            if b.type == "tool_use":
-                h = sub_handlers.get(b.name, lambda **kw: "Unknown tool")
-                results.append({"type": "tool_result", "tool_use_id": b.id, "content": str(h(**b.input))[:50000]})
-        sub_msgs.append({"role": "user", "content": results})
-    if resp:
-        return "".join(b.text for b in resp.content if hasattr(b, "text")) or "(no summary)"
-    return "(subagent failed)"
-
-
-# === SECTION: skills (s05) ===
-class SkillLoader:
-    def __init__(self, skills_dir: Path):
-        self.skills = {}
-        if skills_dir.exists():
-            for f in sorted(skills_dir.rglob("SKILL.md")):
-                text = f.read_text()
-                match = re.match(r"^---\n(.*?)\n---\n(.*)", text, re.DOTALL)
-                meta, body = {}, text
-                if match:
-                    for line in match.group(1).strip().splitlines():
-                        if ":" in line:
-                            k, v = line.split(":", 1)
-                            meta[k.strip()] = v.strip()
-                    body = match.group(2).strip()
-                name = meta.get("name", f.parent.name)
-                self.skills[name] = {"meta": meta, "body": body}
-
-    def descriptions(self) -> str:
-        if not self.skills: return "(no skills)"
-        return "\n".join(f"  - {n}: {s['meta'].get('description', '-')}" for n, s in self.skills.items())
-
-    def load(self, name: str) -> str:
-        s = self.skills.get(name)
-        if not s: return f"Error: Unknown skill '{name}'. Available: {', '.join(self.skills.keys())}"
-        return f"<skill name=\"{name}\">\n{s['body']}\n</skill>"
-
-
-# === SECTION: compression (s06) ===
-def estimate_tokens(messages: list) -> int:
-    return len(json.dumps(messages, default=str)) // 4
-
-def microcompact(messages: list):
-    indices = []
-    for i, msg in enumerate(messages):
-        if msg["role"] == "user" and isinstance(msg.get("content"), list):
-            for part in msg["content"]:
-                if isinstance(part, dict) and part.get("type") == "tool_result":
-                    indices.append(part)
-    if len(indices) <= 3:
-        return
-    for part in indices[:-3]:
-        if isinstance(part.get("content"), str) and len(part["content"]) > 100:
-            part["content"] = "[cleared]"
-
-def auto_compact(messages: list) -> list:
-    TRANSCRIPT_DIR.mkdir(exist_ok=True)
-    path = TRANSCRIPT_DIR / f"transcript_{int(time.time())}.jsonl"
-    with open(path, "w") as f:
-        for msg in messages:
-            f.write(json.dumps(msg, default=str) + "\n")
-    conv_text = json.dumps(messages, default=str)[-80000:]
-    resp = call_llm(
-        messages=[{"role": "user", "content": f"Summarize for continuity:\n{conv_text}"}],
-        max_tokens=2000,
-    )
-    resp = parse_llm_response(resp)
-    summary = resp.content[0].text if resp.content else "(summary failed)"
-    return [
-        {"role": "user", "content": f"[Compressed. Transcript: {path}]\n{summary}"},
-    ]
-
-
-# === SECTION: file_tasks (s07) ===
-class TaskManager:
-    def __init__(self):
-        TASKS_DIR.mkdir(exist_ok=True)
-
-    def _next_id(self) -> int:
-        ids = [int(f.stem.split("_")[1]) for f in TASKS_DIR.glob("task_*.json")]
-        return max(ids, default=0) + 1
-
-    def _load(self, tid: int) -> dict:
-        p = TASKS_DIR / f"task_{tid}.json"
-        if not p.exists(): raise ValueError(f"Task {tid} not found")
-        return json.loads(p.read_text())
-
-    def _save(self, task: dict):
-        (TASKS_DIR / f"task_{task['id']}.json").write_text(json.dumps(task, indent=2))
-
-    def create(self, subject: str, description: str = "") -> str:
-        task = {"id": self._next_id(), "subject": subject, "description": description,
-                "status": "pending", "owner": None, "blockedBy": []}
-        self._save(task)
-        return json.dumps(task, indent=2)
-
-    def get(self, tid: int) -> str:
-        return json.dumps(self._load(tid), indent=2)
-
-    def update(self, tid: int, status: str = None,
-               add_blocked_by: list = None, remove_blocked_by: list = None) -> str:
-        task = self._load(tid)
-        if status:
-            task["status"] = status
-            if status == "completed":
-                for f in TASKS_DIR.glob("task_*.json"):
-                    t = json.loads(f.read_text())
-                    if tid in t.get("blockedBy", []):
-                        t["blockedBy"].remove(tid)
-                        self._save(t)
-            if status == "deleted":
-                (TASKS_DIR / f"task_{tid}.json").unlink(missing_ok=True)
-                return f"Task {tid} deleted"
-        if add_blocked_by:
-            task["blockedBy"] = list(set(task["blockedBy"] + add_blocked_by))
-        if remove_blocked_by:
-            task["blockedBy"] = [x for x in task["blockedBy"] if x not in remove_blocked_by]
-        self._save(task)
-        return json.dumps(task, indent=2)
-
-    def list_all(self) -> str:
-        tasks = [json.loads(f.read_text()) for f in sorted(TASKS_DIR.glob("task_*.json"))]
-        if not tasks: return "No tasks."
-        lines = []
-        for t in tasks:
-            m = {"pending": "[ ]", "in_progress": "[>]", "completed": "[x]"}.get(t["status"], "[?]")
-            owner = f" @{t['owner']}" if t.get("owner") else ""
-            blocked = f" (blocked by: {t['blockedBy']})" if t.get("blockedBy") else ""
-            lines.append(f"{m} #{t['id']}: {t['subject']}{owner}{blocked}")
-        return "\n".join(lines)
-
-    def claim(self, tid: int, owner: str) -> str:
-        task = self._load(tid)
-        task["owner"] = owner
-        task["status"] = "in_progress"
-        self._save(task)
-        return f"Claimed task #{tid} for {owner}"
-
-
-# === SECTION: background (s08) ===
-class BackgroundManager:
-    def __init__(self):
-        self.tasks = {}
-        self.notifications = Queue()
-
-    def run(self, command: str, timeout: int = 120) -> str:
-        tid = str(uuid.uuid4())[:8]
-        self.tasks[tid] = {"status": "running", "command": command, "result": None}
-        threading.Thread(target=self._exec, args=(tid, command, timeout), daemon=True).start()
-        return f"Background task {tid} started: {command[:80]}"
-
-    def _exec(self, tid: str, command: str, timeout: int):
-        try:
-            r = subprocess.run(command, shell=True, cwd=WORKDIR,
-                               capture_output=True, text=True, timeout=timeout)
-            output = (r.stdout + r.stderr).strip()[:50000]
-            self.tasks[tid].update({"status": "completed", "result": output or "(no output)"})
-        except Exception as e:
-            self.tasks[tid].update({"status": "error", "result": str(e)})
-        self.notifications.put({"task_id": tid, "status": self.tasks[tid]["status"],
-                                "result": self.tasks[tid]["result"][:500]})
-
-    def check(self, tid: str = None) -> str:
-        if tid:
-            t = self.tasks.get(tid)
-            return f"[{t['status']}] {t.get('result') or '(running)'}" if t else f"Unknown: {tid}"
-        return "\n".join(f"{k}: [{v['status']}] {v['command'][:60]}" for k, v in self.tasks.items()) or "No bg tasks."
-
-    def drain(self) -> list:
-        notifs = []
-        while not self.notifications.empty():
-            notifs.append(self.notifications.get_nowait())
-        return notifs
-
-
-# === SECTION: messaging (s09) ===
-class MessageBus:
-    def __init__(self):
-        INBOX_DIR.mkdir(parents=True, exist_ok=True)
-
-    def send(self, sender: str, to: str, content: str,
-             msg_type: str = "message", extra: dict = None) -> str:
-        msg = {"type": msg_type, "from": sender, "content": content,
-               "timestamp": time.time()}
-        if extra: msg.update(extra)
-        with open(INBOX_DIR / f"{to}.jsonl", "a") as f:
-            f.write(json.dumps(msg) + "\n")
-        return f"Sent {msg_type} to {to}"
-
-    def read_inbox(self, name: str) -> list:
-        path = INBOX_DIR / f"{name}.jsonl"
-        if not path.exists(): return []
-        msgs = [json.loads(l) for l in path.read_text().strip().splitlines() if l]
-        path.write_text("")
-        return msgs
-
-    def broadcast(self, sender: str, content: str, names: list) -> str:
-        count = 0
-        for n in names:
-            if n != sender:
-                self.send(sender, n, content, "broadcast")
-                count += 1
-        return f"Broadcast to {count} teammates"
-
-
-# === SECTION: shutdown + plan tracking (s10) ===
-shutdown_requests = {}
-plan_requests = {}
-
-
-# === SECTION: team (s09/s11) ===
-class TeammateManager:
-    def __init__(self, bus: MessageBus, task_mgr: TaskManager):
-        TEAM_DIR.mkdir(exist_ok=True)
-        self.bus = bus
-        self.task_mgr = task_mgr
-        self.config_path = TEAM_DIR / "config.json"
-        self.config = self._load()
-        self.threads = {}
-
-    def _load(self) -> dict:
-        if self.config_path.exists():
-            return json.loads(self.config_path.read_text())
-        return {"team_name": "default", "members": []}
-
-    def _save(self):
-        self.config_path.write_text(json.dumps(self.config, indent=2))
-
-    def _find(self, name: str) -> dict:
-        for m in self.config["members"]:
-            if m["name"] == name: return m
-        return None
-
-    def spawn(self, name: str, role: str, prompt: str) -> str:
-        member = self._find(name)
-        if member:
-            if member["status"] not in ("idle", "shutdown"):
-                return f"Error: '{name}' is currently {member['status']}"
-            member["status"] = "working"
-            member["role"] = role
-        else:
-            member = {"name": name, "role": role, "status": "working"}
-            self.config["members"].append(member)
-        self._save()
-        threading.Thread(target=self._loop, args=(name, role, prompt), daemon=True).start()
-        return f"Spawned '{name}' (role: {role})"
-
-    def _set_status(self, name: str, status: str):
-        member = self._find(name)
-        if member:
-            member["status"] = status
-            self._save()
-
-    def _loop(self, name: str, role: str, prompt: str):
-        team_name = self.config["team_name"]
-        sys_prompt = (f"You are '{name}', role: {role}, team: {team_name}, at {WORKDIR}. "
-                      f"Use idle when done with current work. You may auto-claim tasks.")
-        messages = [{"role": "user", "content": prompt}]
-        tools = [
-            {"name": "bash", "description": "Run command.", "input_schema": {"type": "object", "properties": {"command": {"type": "string"}}, "required": ["command"]}},
-            {"name": "read_file", "description": "Read file.", "input_schema": {"type": "object", "properties": {"path": {"type": "string"}}, "required": ["path"]}},
-            {"name": "write_file", "description": "Write file.", "input_schema": {"type": "object", "properties": {"path": {"type": "string"}, "content": {"type": "string"}}, "required": ["path", "content"]}},
-            {"name": "edit_file", "description": "Edit file.", "input_schema": {"type": "object", "properties": {"path": {"type": "string"}, "old_text": {"type": "string"}, "new_text": {"type": "string"}}, "required": ["path", "old_text", "new_text"]}},
-            {"name": "send_message", "description": "Send message.", "input_schema": {"type": "object", "properties": {"to": {"type": "string"}, "content": {"type": "string"}}, "required": ["to", "content"]}},
-            {"name": "idle", "description": "Signal no more work.", "input_schema": {"type": "object", "properties": {}}},
-            {"name": "claim_task", "description": "Claim task by ID.", "input_schema": {"type": "object", "properties": {"task_id": {"type": "integer"}}, "required": ["task_id"]}},
-        ]
-        while True:
-            # -- WORK PHASE --
-            for _ in range(50):
-                inbox = self.bus.read_inbox(name)
-                for msg in inbox:
-                    if msg.get("type") == "shutdown_request":
-                        self._set_status(name, "shutdown")
-                        return
-                    messages.append({"role": "user", "content": json.dumps(msg)})
-                try:
-                    response = call_llm(
-                        system=sys_prompt, messages=messages,
-                        tools=tools, max_tokens=8000)
-                    response = parse_llm_response(response)
-                except Exception:
-                    self._set_status(name, "shutdown")
-                    return
-                messages.append({"role": "assistant", "content": response.content})
-                if response.stop_reason != "tool_use":
-                    break
-                results = []
-                idle_requested = False
-                for block in response.content:
-                    if block.type == "tool_use":
-                        if block.name == "idle":
-                            idle_requested = True
-                            output = "Entering idle phase."
-                        elif block.name == "claim_task":
-                            output = self.task_mgr.claim(block.input["task_id"], name)
-                        elif block.name == "send_message":
-                            output = self.bus.send(name, block.input["to"], block.input["content"])
-                        else:
-                            dispatch = {"bash": lambda **kw: run_bash(kw["command"]),
-                                        "read_file": lambda **kw: run_read(kw["path"]),
-                                        "write_file": lambda **kw: run_write(kw["path"], kw["content"]),
-                                        "edit_file": lambda **kw: run_edit(kw["path"], kw["old_text"], kw["new_text"])}
-                            output = dispatch.get(block.name, lambda **kw: "Unknown")(**block.input)
-                        print(f"  [{name}] {block.name}: {str(output)[:120]}")
-                        results.append({"type": "tool_result", "tool_use_id": block.id, "content": str(output)})
-                messages.append({"role": "user", "content": results})
-                if idle_requested:
-                    break
-            # -- IDLE PHASE: poll for messages and unclaimed tasks --
-            self._set_status(name, "idle")
-            resume = False
-            for _ in range(IDLE_TIMEOUT // max(POLL_INTERVAL, 1)):
-                time.sleep(POLL_INTERVAL)
-                inbox = self.bus.read_inbox(name)
-                if inbox:
-                    for msg in inbox:
-                        if msg.get("type") == "shutdown_request":
-                            self._set_status(name, "shutdown")
-                            return
-                        messages.append({"role": "user", "content": json.dumps(msg)})
-                    resume = True
-                    break
-                unclaimed = []
-                for f in sorted(TASKS_DIR.glob("task_*.json")):
-                    t = json.loads(f.read_text())
-                    if t.get("status") == "pending" and not t.get("owner") and not t.get("blockedBy"):
-                        unclaimed.append(t)
-                if unclaimed:
-                    task = unclaimed[0]
-                    self.task_mgr.claim(task["id"], name)
-                    # Identity re-injection for compressed contexts
-                    if len(messages) <= 3:
-                        messages.insert(0, {"role": "user", "content":
-                            f"<identity>You are '{name}', role: {role}, team: {team_name}.</identity>"})
-                        messages.insert(1, {"role": "assistant", "content": f"I am {name}. Continuing."})
-                    messages.append({"role": "user", "content":
-                        f"<auto-claimed>Task #{task['id']}: {task['subject']}\n{task.get('description', '')}</auto-claimed>"})
-                    messages.append({"role": "assistant", "content": f"Claimed task #{task['id']}. Working on it."})
-                    resume = True
-                    break
-            if not resume:
-                self._set_status(name, "shutdown")
-                return
-            self._set_status(name, "working")
-
-    def list_all(self) -> str:
-        if not self.config["members"]: return "No teammates."
-        lines = [f"Team: {self.config['team_name']}"]
-        for m in self.config["members"]:
-            lines.append(f"  {m['name']} ({m['role']}): {m['status']}")
-        return "\n".join(lines)
-
-    def member_names(self) -> list:
-        return [m["name"] for m in self.config["members"]]
-
-
-# === SECTION: global_instances ===
+import sys
+
+# ---------------------------------------------------------------------------
+# Bootstrap: ensure agents package is importable and .env is loaded.
+# Works for all 3 modes:
+#   1) python agents/s_full.py        (direct, __package__=None)
+#   2) python -m agents.s_full         (module mode)
+#   3) from agents.s_full import ...  (package import)
+# ---------------------------------------------------------------------------
+_THIS_DIR = os.path.dirname(os.path.abspath(__file__))
+_PARENT_DIR = os.path.dirname(_THIS_DIR)       # project root (where .env lives)
+if _PARENT_DIR not in sys.path:
+    sys.path.insert(0, _PARENT_DIR)
+if _THIS_DIR not in sys.path:
+    sys.path.insert(0, _THIS_DIR)
+
+# Load .env from project root BEFORE any agent module imports
+try:
+    from dotenv import load_dotenv
+    load_dotenv(override=True)                       # try CWD first
+    if not os.getenv("GLM_API_KEY") and not os.getenv("ANTHROPIC_BASE_URL"):
+        _env_file = os.path.join(_PARENT_DIR, ".env")
+        if os.path.exists(_env_file):
+            load_dotenv(_env_file, override=True)     # fallback to project root
+except ImportError:
+    pass
+
+# Now safe to import — use absolute imports that work everywhere
+from agents.background import BackgroundManager
+from agents.compression import estimate_tokens, microcompact, auto_compact
+from agents.config import (WORKDIR, TOKEN_THRESHOLD, PROVIDER, MODEL,
+                           SKILLS_DIR)
+from agents.llm import call_llm, parse_llm_response
+from agents.messaging import (MessageBus, handle_shutdown_request,
+                               handle_plan_review)
+from agents.session import SessionManager
+from agents.skills import SkillLoader
+from agents.subagent import run_subagent
+from agents.tasks import TaskManager
+from agents.team import TeammateManager
+from agents.todos import TodoManager
+from agents.tools import run_bash, run_read, run_write, run_edit
+
+# === Global Instances ===
 TODO = TodoManager()
 SKILLS = SkillLoader(SKILLS_DIR)
 TASK_MGR = TaskManager()
@@ -674,31 +116,18 @@ BG = BackgroundManager()
 BUS = MessageBus()
 TEAM = TeammateManager(BUS, TASK_MGR)
 
-# === SECTION: system_prompt ===
-SYSTEM = f"""You are a coding agent at {WORKDIR}. Use tools to solve tasks.
-Prefer task_create/task_update/task_list for multi-step work. Use TodoWrite for short checklists.
-Use task for subagent delegation. Use load_skill for specialized knowledge.
-Skills: {SKILLS.descriptions()}"""
+# Session Manager (tree JSONL)
+SESSION = SessionManager.continue_recent()
 
 
-# === SECTION: shutdown_protocol (s10) ===
-def handle_shutdown_request(teammate: str) -> str:
-    req_id = str(uuid.uuid4())[:8]
-    shutdown_requests[req_id] = {"target": teammate, "status": "pending"}
-    BUS.send("lead", teammate, "Please shut down.", "shutdown_request", {"request_id": req_id})
-    return f"Shutdown request {req_id} sent to '{teammate}'"
-
-# === SECTION: plan_approval (s10) ===
-def handle_plan_review(request_id: str, approve: bool, feedback: str = "") -> str:
-    req = plan_requests.get(request_id)
-    if not req: return f"Error: Unknown plan request_id '{request_id}'"
-    req["status"] = "approved" if approve else "rejected"
-    BUS.send("lead", req["from"], feedback, "plan_approval_response",
-             {"request_id": request_id, "approve": approve, "feedback": feedback})
-    return f"Plan {req['status']} for '{req['from']}'"
+# === System Prompt ===
+SYSTEM = f"""你是一个在 {WORKDIR} 工作的编程助手。使用工具来完成任务。
+多步骤工作优先使用 task_create/task_update/task_list。简短清单用 TodoWrite。
+用 task 调度子代理。用 load_skill 加载专业知识。
+可用技能：{SKILLS.descriptions()}"""
 
 
-# === SECTION: tool_dispatch (s02) ===
+# === Tool Definitions ===
 TOOL_HANDLERS = {
     "bash":             lambda **kw: run_bash(kw["command"]),
     "read_file":        lambda **kw: run_read(kw["path"], kw.get("limit")),
@@ -707,12 +136,13 @@ TOOL_HANDLERS = {
     "TodoWrite":        lambda **kw: TODO.update(kw["items"]),
     "task":             lambda **kw: run_subagent(kw["prompt"], kw.get("agent_type", "Explore")),
     "load_skill":       lambda **kw: SKILLS.load(kw["name"]),
-    "compress":         lambda **kw: "Compressing...",
+    "compress":         lambda **kw: _do_compact(),
     "background_run":   lambda **kw: BG.run(kw["command"], kw.get("timeout", 120)),
     "check_background": lambda **kw: BG.check(kw.get("task_id")),
     "task_create":      lambda **kw: TASK_MGR.create(kw["subject"], kw.get("description", "")),
     "task_get":         lambda **kw: TASK_MGR.get(kw["task_id"]),
-    "task_update":      lambda **kw: TASK_MGR.update(kw["task_id"], kw.get("status"), kw.get("add_blocked_by"), kw.get("remove_blocked_by")),
+    "task_update":      lambda **kw: TASK_MGR.update(kw["task_id"], kw.get("status"),
+                                                     kw.get("add_blocked_by"), kw.get("remove_blocked_by")),
     "task_list":        lambda **kw: TASK_MGR.list_all(),
     "spawn_teammate":   lambda **kw: TEAM.spawn(kw["name"], kw["role"], kw["prompt"]),
     "list_teammates":   lambda **kw: TEAM.list_all(),
@@ -721,68 +151,484 @@ TOOL_HANDLERS = {
     "broadcast":        lambda **kw: BUS.broadcast("lead", kw["content"], TEAM.member_names()),
     "shutdown_request": lambda **kw: handle_shutdown_request(kw["teammate"]),
     "plan_approval":    lambda **kw: handle_plan_review(kw["request_id"], kw["approve"], kw.get("feedback", "")),
-    "idle":             lambda **kw: "Lead does not idle.",
+    "idle":             lambda **kw: "主代理不进入空闲状态。",
     "claim_task":       lambda **kw: TASK_MGR.claim(kw["task_id"], "lead"),
+    # Session tools
+    "session_branch":   lambda **kw: _do_session_branch(kw.get("entry_id")),
+    "session_list":     lambda **kw: _do_session_list(),
+    "session_history":  lambda **kw: _do_session_history(),
+    "session_switch":   lambda **kw: _do_session_switch(kw.get("selection")),
+    "session_search":    lambda **kw: _do_session_search(kw.get("query"), kw.get("global", False), kw.get("limit", 20)),
+    "session_search_stats": lambda **kw: _format_search_stats(),
 }
 
 TOOLS = [
-    {"name": "bash", "description": "Run a shell command.",
+    {"name": "bash", "description": "执行 Shell 命令。",
      "input_schema": {"type": "object", "properties": {"command": {"type": "string"}}, "required": ["command"]}},
-    {"name": "read_file", "description": "Read file contents.",
+    {"name": "read_file", "description": "读取文件内容。",
      "input_schema": {"type": "object", "properties": {"path": {"type": "string"}, "limit": {"type": "integer"}}, "required": ["path"]}},
-    {"name": "write_file", "description": "Write content to file.",
+    {"name": "write_file", "description": "写入文件内容。",
      "input_schema": {"type": "object", "properties": {"path": {"type": "string"}, "content": {"type": "string"}}, "required": ["path", "content"]}},
-    {"name": "edit_file", "description": "Replace exact text in file.",
+    {"name": "edit_file", "description": "替换文件中的精确文本。",
      "input_schema": {"type": "object", "properties": {"path": {"type": "string"}, "old_text": {"type": "string"}, "new_text": {"type": "string"}}, "required": ["path", "old_text", "new_text"]}},
-    {"name": "TodoWrite", "description": "Update task tracking list.",
+    {"name": "TodoWrite", "description": "更新任务跟踪清单。",
      "input_schema": {"type": "object", "properties": {"items": {"type": "array", "items": {"type": "object", "properties": {"content": {"type": "string"}, "status": {"type": "string", "enum": ["pending", "in_progress", "completed"]}, "activeForm": {"type": "string"}}, "required": ["content", "status", "activeForm"]}}}, "required": ["items"]}},
-    {"name": "task", "description": "Spawn a subagent for isolated exploration or work.",
+    {"name": "task", "description": "生成子代理，用于隔离式探索或执行任务。",
      "input_schema": {"type": "object", "properties": {"prompt": {"type": "string"}, "agent_type": {"type": "string", "enum": ["Explore", "general-purpose"]}}, "required": ["prompt"]}},
-    {"name": "load_skill", "description": "Load specialized knowledge by name.",
+    {"name": "load_skill", "description": "按名称加载专业技能知识。",
      "input_schema": {"type": "object", "properties": {"name": {"type": "string"}}, "required": ["name"]}},
-    {"name": "compress", "description": "Manually compress conversation context.",
+    {"name": "compress", "description": "手动压缩对话上下文。",
      "input_schema": {"type": "object", "properties": {}}},
-    {"name": "background_run", "description": "Run command in background thread.",
+    {"name": "background_run", "description": "在后台线程中运行命令。",
      "input_schema": {"type": "object", "properties": {"command": {"type": "string"}, "timeout": {"type": "integer"}}, "required": ["command"]}},
-    {"name": "check_background", "description": "Check background task status.",
+    {"name": "check_background", "description": "检查后台任务状态。",
      "input_schema": {"type": "object", "properties": {"task_id": {"type": "string"}}}},
-    {"name": "task_create", "description": "Create a persistent file task.",
+    {"name": "task_create", "description": "创建持久化文件任务。",
      "input_schema": {"type": "object", "properties": {"subject": {"type": "string"}, "description": {"type": "string"}}, "required": ["subject"]}},
-    {"name": "task_get", "description": "Get task details by ID.",
+    {"name": "task_get", "description": "根据 ID 获取任务详情。",
      "input_schema": {"type": "object", "properties": {"task_id": {"type": "integer"}}, "required": ["task_id"]}},
-    {"name": "task_update", "description": "Update task status or dependencies.",
+    {"name": "task_update", "description": "更新任务状态或依赖关系。",
      "input_schema": {"type": "object", "properties": {"task_id": {"type": "integer"}, "status": {"type": "string", "enum": ["pending", "in_progress", "completed", "deleted"]}, "add_blocked_by": {"type": "array", "items": {"type": "integer"}}, "remove_blocked_by": {"type": "array", "items": {"type": "integer"}}}, "required": ["task_id"]}},
-    {"name": "task_list", "description": "List all tasks.",
+    {"name": "task_list", "description": "列出所有任务。",
      "input_schema": {"type": "object", "properties": {}}},
-    {"name": "spawn_teammate", "description": "Spawn a persistent autonomous teammate.",
+    {"name": "spawn_teammate", "description": "生成持久化自主队友。",
      "input_schema": {"type": "object", "properties": {"name": {"type": "string"}, "role": {"type": "string"}, "prompt": {"type": "string"}}, "required": ["name", "role", "prompt"]}},
-    {"name": "list_teammates", "description": "List all teammates.",
+    {"name": "list_teammates", "description": "列出所有队友。",
      "input_schema": {"type": "object", "properties": {}}},
-    {"name": "send_message", "description": "Send a message to a teammate.",
-     "input_schema": {"type": "object", "properties": {"to": {"type": "string"}, "content": {"type": "string"}, "msg_type": {"type": "string", "enum": list(VALID_MSG_TYPES)}}, "required": ["to", "content"]}},
-    {"name": "read_inbox", "description": "Read and drain the lead's inbox.",
+    {"name": "send_message", "description": "向队友发送消息。",
+     "input_schema": {"type": "object", "properties": {"to": {"type": "string"}, "content": {"type": "string"}, "msg_type": {"type": "string"}}, "required": ["to", "content"]}},
+    {"name": "read_inbox", "description": "读取并排空主代理收件箱。",
      "input_schema": {"type": "object", "properties": {}}},
-    {"name": "broadcast", "description": "Send message to all teammates.",
+    {"name": "broadcast", "description": "向所有队友广播消息。",
      "input_schema": {"type": "object", "properties": {"content": {"type": "string"}}, "required": ["content"]}},
-    {"name": "shutdown_request", "description": "Request a teammate to shut down.",
+    {"name": "shutdown_request", "description": "请求队友关闭。",
      "input_schema": {"type": "object", "properties": {"teammate": {"type": "string"}}, "required": ["teammate"]}},
-    {"name": "plan_approval", "description": "Approve or reject a teammate's plan.",
+    {"name": "plan_approval", "description": "审批或驳回队友的计划。",
      "input_schema": {"type": "object", "properties": {"request_id": {"type": "string"}, "approve": {"type": "boolean"}, "feedback": {"type": "string"}}, "required": ["request_id", "approve"]}},
-    {"name": "idle", "description": "Enter idle state.",
+    {"name": "idle", "description": "进入空闲状态。",
      "input_schema": {"type": "object", "properties": {}}},
-    {"name": "claim_task", "description": "Claim a task from the board.",
+    {"name": "claim_task", "description": "从任务板上认领任务。",
      "input_schema": {"type": "object", "properties": {"task_id": {"type": "integer"}}, "required": ["task_id"]}},
+    # Session tools
+    {"name": "session_branch", "description": "将会话分支到之前的某个节点（类似 git checkout）。不传参数时显示可用条目列表。",
+     "input_schema": {"type": "object", "properties": {"entry_id": {"type": "string", "description": "要分支到的条目 ID。省略时显示可用条目列表。"}}}},
+    {"name": "session_list", "description": "列出所有已保存的会话，带序号方便选择。",
+     "input_schema": {"type": "object", "properties": {}}},
+    {"name": "session_history", "description": "显示当前会话历史（树形结构）。",
+     "input_schema": {"type": "object", "properties": {}}},
+    {"name": "session_switch", "description": "通过序号或 ID 前缀切换到其他会话。建议先用 session_list 查看序号。",
+     "input_schema": {"type": "object", "properties": {"selection": {"type": "string", "description": "会话序号（如 '1'）或 ID 前缀（如 '41b74290'）。"}}}},
+    {"name": "session_search", "description": "使用 SQLite FTS5 对会话条目进行全文搜索。支持 AND、OR、NOT、phrase queries, and 前缀通配符s.",
+     "input_schema": {"type": "object", "properties": {
+         "query": {"type": "string", "description": "FTS5 search expression. Examples: 'SQLite AND FTS5', '\"compac*\"', 'NEAR(\"session\" \"search\")', 'session OR branch'"},
+         "global": {"type": "boolean", "description": "为 True 时搜索所有会话，为 False（默认）仅搜索当前会话。"},
+         "limit": {"type": "integer", "description": "返回的最大结果数量（默认 20）。"}
+     }, "required": ["query"]}},
+    {"name": "session_search_stats", "description": "显示搜索索引的统计信息（总条目数、已索引会话数、数据库大小等）。",
+     "input_schema": {"type": "object", "properties": {}}},
 ]
 
 
-# === SECTION: agent_loop ===
+# === Session-aware helpers ===
+
+def _do_compact() -> str:
+    """Perform compaction using the session manager's context."""
+    ctx = SESSION.build_context()
+    messages = ctx["messages"]
+    if len(messages) <= 2:
+        return "上下文不足，无法压缩。"
+    tokens = estimate_tokens(messages)
+    # Generate summary via LLM and store as compaction entry
+    conv_text = json.dumps(messages, default=str)[-80000:]
+    from agents.llm import call_llm as _call, parse_llm_response as _parse
+    resp = _call(
+        messages=[{"role": "user", "content": f"请对以下对话进行摘要，保持上下文连贯性：\n{conv_text}"}],
+        max_tokens=2000,
+    )
+    resp = _parse(resp)
+    summary = resp.content[0].text if resp.content else "（摘要生成失败）"
+    # Find first message entry ID as firstKeptEntryId
+    entries = SESSION.get_entries()
+    kept_id = None
+    for e in entries:
+        if e.get("type") == "message":
+            kept_id = e.get("id")
+            break
+    if kept_id:
+        SESSION.append_compaction(summary, kept_id, tokens)
+    return f"已压缩（{tokens} tokens → 摘要）。会话已在压缩点分支。"
+
+
+def _do_session_branch(entry_id: str = None) -> str:
+    """Branch to an entry or show available entries."""
+    if not entry_id:
+        # Show available entries
+        entries = SESSION.get_entries()
+        if not entries:
+            return "当前会话没有任何条目。"
+        lines = [f"当前会话：{SESSION.session_id}", f"当前叶节点：{SESSION.leaf_id}",
+                 f"文件： {SESSION.session_file}", "", "Entries:"]
+        for e in entries:
+            eid = e.get("id", "?")
+            etype = e.get("type", "?")
+            pid = e.get("parentId") or "root"
+            label = SESSION.get_label(eid)
+            marker = " <- * LEAF" if eid == SESSION.leaf_id else ""
+            lbl_str = f" [label: {label}]" if label else ""
+            # Show preview based on type
+            if etype == "message":
+                msg = e.get("message", {})
+                role = msg.get("role", "?")
+                content = msg.get("content", "")
+                if isinstance(content, str):
+                    preview = content[:50].replace("\n", " ")
+                elif isinstance(content, list):
+                    parts = []
+                    for p in content:
+                        if isinstance(p, dict) and p.get("type") == "text":
+                            parts.append(p.get("text", "")[:30])
+                    preview = " ".join(parts)[:50]
+                else:
+                    preview = "(...)"
+                preview_str = f"  [{role}] {preview}"
+            elif etype == "compaction":
+                summary = e.get("summary", "")[:50]
+                preview_str = f"  [compaction] {summary}..."
+            elif etype == "branch_summary":
+                summary = e.get("summary", "")[:50]
+                preview_str = f"  [branch_summary] {summary}..."
+            else:
+                preview_str = f"  [{etype}]"
+            lines.append(f"  {eid} (parent={pid}){marker}{lbl_str}")
+            lines.append(f"    {preview_str}")
+        lines.append("")
+        lines.append("提示：使用 session_branch <entry_id> 回到之前的节点。")
+        return "\n".join(lines)
+    else:
+        try:
+            SESSION.branch(entry_id)
+            ctx = SESSION.build_context()
+            return f"已分支到 {entry_id}。当前上下文有 {len(ctx['messages'])} 条消息。下一条消息将开始新分支。"
+        except ValueError as ex:
+            return f"错误：{ex}"
+
+
+def _do_session_list() -> str:
+    """List all sessions with numbers for easy selection."""
+    sessions = SessionManager.list_sessions()
+    if not sessions:
+        return "没有保存的会话。使用 /session_new 创建一个。"
+    current_id = SESSION.session_id
+    lines = [
+        f"工作目录 {WORKDIR} 下的所有会话：",
+        f"（使用：/switch <序号> 或 session_switch(number=<n>)）",
+        "",
+    ]
+    for i, s in enumerate(sessions, 1):
+        is_current = s["id"] == current_id
+        marker = " ◆ CURRENT" if is_current else ""
+        # Relative time
+        mod_time = s.get("modified", "")
+        lines.append(
+            f"  \033[33m[{i}]\033[0m  {s['id'][:12]}  "
+            f"msgs={s['messageCount']:>3}  "
+            f"{mod_time}{marker}"
+        )
+        preview = s.get("firstMessage", "(empty)")
+        lines.append(f"       {preview[:65]}")
+    lines.append("")
+    lines.append(f"共 {len(sessions)} 个会话")
+    return "\n".join(lines)
+
+
+# Session switch state — stores the list so /switch <n> can look up by index
+_cached_sessions = []
+
+
+def _do_session_switch(selection: str) -> str:
+    """
+    Switch to a different session.
+    selection can be:
+      - A number (1-based index from /sessions list)
+      - A session ID (full or prefix)
+      - A file path
+    """
+    global SESSION, _cached_sessions
+
+    selection = (selection or "").strip()
+    if not selection:
+        # No arg → show list and prompt
+        _cached_sessions = SessionManager.list_sessions()
+        if not _cached_sessions:
+            return "没有可切换的会话。先用 /session_new 创建一个。"
+        return _do_session_list() + '\n用法：/switch <序号> 或 /switch <会话ID前缀>'
+
+    # Try numeric index first
+    try:
+        idx = int(selection)
+        _cached_sessions = SessionManager.list_sessions()
+        if 1 <= idx <= len(_cached_sessions):
+            target = _cached_sessions[idx - 1]
+            return _switch_to_session(target["path"], target["id"])
+        return f"序号超出范围，有效范围：1-{len(_cached_sessions)}"
+    except ValueError:
+        pass
+
+    # Try session ID prefix match
+    _cached_sessions = SessionManager.list_sessions()
+    matches = [s for s in _cached_sessions if s["id"].startswith(selection)]
+    if len(matches) == 1:
+        return _switch_to_session(matches[0]["path"], matches[0]["id"])
+    elif len(matches) > 1:
+        ids = [s["id"][:12] for s in matches]
+        return f"前缀 '{selection}' 匹配到多个会话：\n  " + "\n  ".join(ids)
+
+    # Try as file path
+    from pathlib import Path as _P
+    p = _P(selection)
+    if p.exists():
+        return _switch_to_session(str(p), "???")
+
+    return f"未找到会话：'{selection}'。使用 /session_list 查看可用会话。"
+
+
+def _switch_to_session(filepath: str, session_id: str) -> str:
+    """Core switch logic: reload SESSION global, return status message."""
+    global SESSION
+    old_id = SESSION.session_id
+    old_file = SESSION.session_file
+
+    try:
+        new_session = SessionManager.open_session(filepath)
+        SESSION = new_session
+        # Update the global that agent_loop / build_context will use
+        entries = new_session.get_entries()
+        msg_count = sum(1 for e in entries if e.get("type") == "message")
+        return (
+            f"\033[32m✓ Switched session\033[0m\n"
+            f"  {old_id[:12]} → {session_id[:12]}\n"
+            f"  文件： {filepath}\n"
+            f"  Messages: {msg_count}\n"
+            f"  Leaf: {SESSION.leaf_id}\n"
+            f"  （后续消息将追加到此会话的当前分支）"
+        )
+    except Exception as e:
+        return f"\033[31m切换会话失败：\033[0m {e}"
+
+
+def _do_session_search(query: str = None, global_search: bool = False,
+                        limit: int = 20) -> str:
+    """Search session entries using SQLite FTS5 full-text search."""
+    if not query:
+        return (
+            "会话全文搜索（FTS5）\n"
+            "用法：\n"
+            "  /session_search <query>           — 搜索当前会话\n"
+            "  /session_search global <query>     — 搜索所有会话\n"
+            "  /session_search stats              — 显示索引统计\n"
+            "  /session_search rebuild            — 从 JSONL 文件重建索引\n"
+            "\n"
+            "查询语法示例：\n"
+            "  'SQLite AND FTS5'       与查询（AND）\n"
+            "  'session OR branch'     或查询（OR）\n"
+            "  '\"compac*\"'             前缀通配符\n"
+            '  "\'\"full text\"\'"        短语精确匹配\n'
+            "  'session NOT branch'    排除查询（NOT）\n"
+        )
+
+    try:
+        if global_search:
+            result = SessionManager.global_search(query, limit=limit)
+            return _format_global_search_result(result, limit)
+        else:
+            results = SESSION.search(query, limit=limit)
+            return _format_search_results(results, query)
+    except Exception as e:
+        return f"搜索错误： {e}"
+
+
+def _format_search_results(results: list[dict], query: str) -> str:
+    """Format single-session search results for display."""
+    if not results:
+        return f"当前会话未找到匹配结果：{query}"
+
+    if results and results[0].get("error"):
+        return f"搜索错误： {results[0]['error']}"
+
+    lines = [
+        f"搜索结果（当前会话： {SESSION.session_id[:12]}):",
+        f"查询词： {query}",
+        f"匹配数： {len(results)}",
+        "",
+    ]
+    for r in results:
+        eid = r.get("entry_id", "?")
+        etype = r.get("entry_type", "?")
+        role = r.get("role", "")
+        snippet = r.get("snippet", "") or r.get("content", "（无内容）")[:120]
+        ts = r.get("timestamp", "?")[11:19]  # just time
+        rank = r.get("rank", "?")
+        marker = "◆" if eid == SESSION.leaf_id else " "
+        lines.append(f"  {marker} \033[33m{eid}\033[0m [{etype}/{role}] rank={rank} {ts}")
+        # Indented snippet
+        for snip_line in snippet.split("\n")[:3]:
+            lines.append(f"      {snip_line.strip()[:100]}")
+        lines.append("")
+
+    lines.append("提示：可使用 session_switch 切换到对应条目，或用 session_branch <entry_id> 回溯。")
+    return "\n".join(lines)
+
+
+def _format_global_search_result(result: dict, limit: int) -> str:
+    """Format cross-session search results for display."""
+    entries = result.get("entries", [])
+    sessions = result.get("sessions", [])
+
+    if (not entries or entries[0].get("error")) and not sessions:
+        query_str = result.get("entries", [{}])[0].get("error", "unknown") if entries else "no results"
+        return f"全局搜索： {query_str}"
+
+    lines = [
+        "╔══════════════════════════════════════════════╗",
+        "║     全局搜索结果（所有会话）                     ║",
+        "╚══════════════════════════════════════════════╝",
+        "",
+    ]
+
+    # Show matching sessions first (grouped view)
+    if sessions:
+        lines.append(f"--- 匹配的会话 ({len(sessions)}) ---")
+        for s in sessions:
+            sid = s.get("session_id", "?")[:12]
+            count = s.get("match_count", 0)
+            best_rank = s.get("best_rank", "?")
+            cwd = s.get("cwd", "")[-40:]
+            types = s.get("types", "")
+            lines.append(
+                f"  \033[33m{sid}\033[0m  matches={count}  "
+                f"best_rank={best_rank}  cwd=...{cwd}  types={types}"
+            )
+        lines.append("")
+
+    # Show top individual entries
+    if entries:
+        show_entries = entries[:limit]
+        lines.append(f"--- 条目列表 ({len(show_entries)} of {len(entries)}) ---")
+        for r in show_entries:
+            eid = r.get("entry_id", "?")
+            sid = r.get("session_id", "?")[:12]
+            etype = r.get("entry_type", "?")
+            role = r.get("role", "")
+            snippet = r.get("snippet", "") or "（无内容）"
+            ts = r.get("timestamp", "?")[11:19]
+            rank = r.get("rank", "?")
+            lines.append(f"  \033[33m{eid}\033[0m (sess:{sid}) [{etype}/{role}] rank={rank} {ts}")
+            for snip_line in snippet.split("\n")[:2]:
+                lines.append(f"      {snip_line.strip()[:100]}")
+            lines.append("")
+
+    lines.append("提示：使用 session_switch <会话ID前缀> 切换到匹配的会话。")
+    return "\n".join(lines)
+
+
+def _format_search_stats() -> str:
+    """Format search index statistics for display."""
+    stats = SessionManager.search_stats()
+    if "error" in stats:
+        return f"搜索索引错误： {stats['error']}"
+
+    lines = [
+        "┌─────────────────────────────────────┐",
+        "│     搜索索引统计（FTS5）  │",
+        "└─────────────────────────────────────┘",
+        "",
+        f"  总条目数：    {stats.get('total_entries', 0)}",
+        f"  已索引会话数： {stats.get('sessions_indexed', 0)}",
+        f"  工作目录数：        {stats.get('working_directories', 0)}",
+        f"  数据库大小：    {stats.get('db_size_human', '?')}",
+        f"  数据库路径：          {stats.get('db_path', '?')}",
+        "",
+        "  按类型：",
+    ]
+    for t, c in stats.get("by_type", {}).items():
+        lines.append(f"    {t}: {c}")
+    return "\n".join(lines)
+
+
+def _do_session_history() -> str:
+    """Show session tree structure with pretty Unicode box-drawing."""
+    tree = SESSION.get_tree()
+    if not tree:
+        return "当前会话没有任何条目。"
+
+    def _preview(entry):
+        etype = entry.get("type", "?")
+        if etype == "message":
+            msg = entry.get("message", {})
+            role = msg.get("role", "?")
+            content = msg.get("content", "")
+            if isinstance(content, str):
+                text = content[:40].replace("\n", " ")
+            else:
+                text = "(...)"
+            return f"[{role}] {text}"
+        elif etype == "compaction":
+            return f"[compaction] {entry.get('summary', '')[:40]}..."
+        elif etype == "branch_summary":
+            return f"[branch_summary] {entry.get('summary', '')[:40]}..."
+        else:
+            return f"[{etype}]"
+
+    def _render(node, prefix: str = "", is_last: bool = True):
+        """
+        Unified tree renderer using prefix-accumulation.
+        prefix: the indentation string for this node's level
+        is_last: whether this node is the last child of its parent
+        """
+        entry = node["entry"]
+        eid = entry.get("id", "?")
+        children = node.get("children", [])
+        label = node.get("_label")
+
+        is_current_leaf = (eid == SESSION.leaf_id)
+        marker = "◆ " if is_current_leaf else "  "
+        detail = _preview(entry)
+        lbl = f"  🏷{label}" if label else ""
+
+        # Draw this node
+        connector = "└─ " if (prefix == "" or is_last) else "├─ "
+        lines = [f"{prefix}{connector}{marker}{eid}: {detail}{lbl}"]
+
+        # Draw children
+        n = len(children)
+        for i, child in enumerate(children):
+            child_is_last = (i == n - 1)
+            # Extend prefix: add vertical continuation or space
+            child_prefix = prefix + ("   " if is_last else "│  ")
+            lines.extend(_render(child, child_prefix, child_is_last))
+
+        return lines
+
+    result = [
+        f"会话ID： {SESSION.session_id}",
+        f"文件： {SESSION.session_file}",
+        "",
+    ]
+    for root in tree:
+        result.extend(_render(root))
+    return "\n".join(result)
+
+
+# === Agent Loop (now session-aware) ===
+
 def agent_loop(messages: list):
+    """Main agent loop with full tool dispatch and session integration."""
     rounds_without_todo = 0
     while True:
         # s06: compression pipeline
         microcompact(messages)
         if estimate_tokens(messages) > TOKEN_THRESHOLD:
-            print("[auto-compact triggered]")
+            print("[触发自动压缩]")
             messages[:] = auto_compact(messages)
         # s08: drain background notifications
         notifs = BG.drain()
@@ -800,6 +646,19 @@ def agent_loop(messages: list):
         )
         response = parse_llm_response(response)
         messages.append({"role": "assistant", "content": response.content})
+
+        # Persist to session (tree JSONL)
+        if response.content:
+            for block in response.content:
+                if hasattr(block, 'text') and block.type == "text":
+                    pass
+                elif hasattr(block, 'type') and block.type == "tool_use":
+                    pass
+            try:
+                SESSION.append_message({"role": "assistant", "content": response.content})
+            except Exception:
+                pass  # non-critical
+
         if response.stop_reason != "tool_use":
             return
         # Tool execution
@@ -812,55 +671,126 @@ def agent_loop(messages: list):
                     manual_compress = True
                 handler = TOOL_HANDLERS.get(block.name)
                 try:
-                    output = handler(**block.input) if handler else f"Unknown tool: {block.name}"
+                    output = handler(**block.input) if handler else f"未知工具： {block.name}"
                 except Exception as e:
-                    output = f"Error: {e}"
+                    output = f"错误：{e}"
                 print(f"> {block.name}:")
                 print(str(output)[:200])
                 results.append({"type": "tool_result", "tool_use_id": block.id, "content": str(output)})
                 if block.name == "TodoWrite":
                     used_todo = True
-        # s03: nag reminder (only when todo workflow is active)
+        # s03: nag reminder
         rounds_without_todo = 0 if used_todo else rounds_without_todo + 1
         if TODO.has_open_items() and rounds_without_todo >= 3:
-            results.append({"type": "text", "text": "<reminder>Update your todos.</reminder>"})
+            results.append({"type": "text", "text": "<reminder>请更新你的待办事项。</reminder>"})
         messages.append({"role": "user", "content": results})
         # s06: manual compress
         if manual_compress:
-            print("[manual compact]")
+            print("[手动压缩]")
             messages[:] = auto_compact(messages)
             return
 
 
-# === SECTION: repl ===
+# === REPL ===
+
 if __name__ == "__main__":
-    history = []
+    # Resume or create session
+    print(f"会话ID： {SESSION.session_id}")
+    print(f"文件： {SESSION.session_file}")
+    print(f"工作目录：{WORKDIR}")
+    print(f"提供商：{PROVIDER} / 模型：{MODEL}")
+    print()
+
     while True:
         try:
-            query = input("\033[36ms_full >> \033[0m")
+            query = input("\033[36mAgentclaw >> \033[0m")
         except (EOFError, KeyboardInterrupt):
             break
         if query.strip().lower() in ("q", "exit", ""):
             break
-        if query.strip() == "/compact":
-            if history:
+
+        # REPL commands
+        cmd = query.strip()
+
+        if cmd == "/compact":
+            if any(True for m in SESSION.get_entries() if m.get("type") == "message"):
                 print("[manual compact via /compact]")
-                history[:] = auto_compact(history)
+                ctx = SESSION.build_context()
+                messages = ctx["messages"]
+                if len(messages) > 2:
+                    messages[:] = auto_compact(messages)
+                else:
+                    print("内容不足，无法压缩。")
             continue
-        if query.strip() == "/tasks":
+
+        if cmd == "/tasks":
             print(TASK_MGR.list_all())
             continue
-        if query.strip() == "/team":
+
+        if cmd == "/team":
             print(TEAM.list_all())
             continue
-        if query.strip() == "/inbox":
+
+        if cmd == "/inbox":
             print(json.dumps(BUS.read_inbox("lead"), indent=2))
             continue
-        history.append({"role": "user", "content": query})
-        agent_loop(history)
-        response_content = history[-1]["content"]
-        if isinstance(response_content, list):
-            for block in response_content:
-                if hasattr(block, "text"):
-                    print(block.text)
+
+        # --- Session commands (all /session_*) ---
+        if cmd == "/session_list":
+            print(_do_session_list())
+            continue
+
+        if cmd.startswith("/session_switch"):
+            arg = cmd.split(maxsplit=1)[1] if len(cmd.split()) > 1 else None
+            print(_do_session_switch(arg))
+            continue
+
+        if cmd == "/session_history":
+            print(_do_session_history())
+            continue
+
+        if cmd.startswith("/session_branch"):
+            arg = cmd.split(maxsplit=1)[1] if len(cmd.split()) > 1 else None
+            print(_do_session_branch(arg))
+            continue
+
+        if cmd == "/session_new":
+            SESSION._new_session()
+            print(f"新会话：{SESSION.session_id}")
+            continue
+
+        # --- Search commands ---
+        if cmd.startswith("/session_search "):
+            arg = cmd[len("/session_search "):].strip()
+            if arg.lower() == "stats":
+                print(_format_search_stats())
+            elif arg.lower() == "rebuild":
+                print(SessionManager.rebuild_global_search_index())
+            elif arg.lower().startswith("global "):
+                q = arg[7:].strip()
+                print(_do_session_search(q, global_search=True))
+            else:
+                print(_do_session_search(arg))
+            continue
+
+        if cmd == "/session_search":
+            print(_do_session_search())
+            continue
+
+        # Normal user input -> append to session + run agent loop
+        SESSION.append_message({"role": "user", "content": query})
+        agent_loop([{"role": "user", "content": query}])
+
+        # Print last response
+        ctx = SESSION.build_context()
+        if ctx["messages"]:
+            last = ctx["messages"][-1]
+            if isinstance(last, dict) and last.get("role") == "assistant":
+                content = last.get("content", "")
+                if isinstance(content, list):
+                    for block in content:
+                        if hasattr(block, "text"):
+                            print(block.text)
+                elif isinstance(content, str):
+                    print(content)
         print()
