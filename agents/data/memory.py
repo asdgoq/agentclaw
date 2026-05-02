@@ -19,7 +19,7 @@ import uuid
 from datetime import datetime
 from pathlib import Path
 
-from .config import WORKDIR
+from ..core.config import WORKDIR
 
 MEMORY_FILE = WORKDIR / ".memory.jsonl"
 

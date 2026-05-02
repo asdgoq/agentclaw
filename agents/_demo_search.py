@@ -12,8 +12,8 @@ if _PARENT_DIR not in sys.path:
 if _THIS_DIR not in sys.path:
     sys.path.insert(0, _THIS_DIR)
 
-from agents.search import close_search_db, _get_db_path
-from agents.session import SessionManager
+from agents.data.search import close_search_db, _get_db_path
+from agents.core.session import SessionManager
 
 # 清理
 close_search_db()

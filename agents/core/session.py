@@ -1,27 +1,31 @@
 #!/usr/bin/env python3
 """
-Tree-structured JSONL Session Manager (inspired by pi-mono's design).
+树形 JSONL 会话管理器（灵感来自 pi-mono 的设计）。
 
-Core concepts:
-  - Each session is a single .jsonl file
-  - Every entry has `id` + `parentId`, forming a tree (like Git!)
-  - A `leaf` pointer tracks the current position
-  - Appending creates a child of the current leaf
-  - Branching moves the leaf to an earlier entry (zero-copy, like git checkout)
-  - Compaction inserts a summary node when context grows too long
+核心概念：
+  - 每个会话是一个独立的 .jsonl 文件
+  - 每条记录都有 `id` + `parentId`，形成树形结构（类似 Git！）
+  - `leaf`（叶节点）指针追踪当前位置
+  - 追加操作在当前叶节点下创建子节点
+  - 分支操作将叶节点移动到更早的记录（零拷贝，类似 git checkout）
+  - 压缩在上下文过长时插入摘要节点
 
-Entry types:
-  - session_header: file metadata (id, timestamp, cwd, version)
-  - message: user/assistant/tool_result messages
-  - compaction: LLM-generated summary of old context
-  - branch_summary: summary of an abandoned branch path
-  - model_change: model switch record
-  - label: user bookmark on an entry
-  - custom: extension data (not sent to LLM)
-  - custom_message: extension-injected message (sent to LLM)
+记录类型：
+  - session_header: 文件元数据（id、时间戳、工作目录、版本）
+  - message: 用户/助手/工具结果消息
+  - compaction: LLM 生成的旧上下文摘要
+  - branch_summary: 已放弃分支路径的摘要
+  - model_change: 模型切换记录
+  - label: 用户对某条记录的书签标记
+  - custom: 扩展数据（不发送给 LLM）
+  - custom_message: 扩展注入的消息（会发送给 LLM）
+  - thought_chain: 思维链记录（CoT 推理过程，可选择性注入上下文）
+  - thought_tree: 思维树记录（ToT 搜索过程，可选择性注入上下文）
+  - thought_graph: 思维图记录（GoT 推理过程，可选择性注入上下文）
+  - thinking_level_change: 思维模式切换记录
 
-File layout:
-    ~/.sessions/<encoded-cwd>/<timestamp>_<uuid>.jsonl
+文件存储路径：
+    ~/.sessions/<编码后的工作目录>/<时间戳>_<uuid>.jsonl
 """
 
 from __future__ import annotations
@@ -32,23 +36,23 @@ import uuid
 from pathlib import Path
 from typing import Any, Optional
 
-from .config import SESSIONS_DIR, WORKDIR
+from ..core.config import SESSIONS_DIR, WORKDIR
 
 # ---------------------------------------------------------------------------
-# Version & Constants
+# 版本号与常量
 # ---------------------------------------------------------------------------
 
 CURRENT_SESSION_VERSION = 1
 
 
 # ---------------------------------------------------------------------------
-# Entry Types (dataclass-like using plain dicts for JSONL simplicity)
+# 记录类型（使用普通字典模拟 dataclass，以简化 JSONL 序列化）
 # ---------------------------------------------------------------------------
 
 
 def make_session_header(session_id: str = None, cwd: str = None,
                         parent_session: str = None) -> dict:
-    """Create session header (first line of every .jsonl file)."""
+    """创建会话头（每个 .jsonl 文件的第一行）。"""
     return {
         "type": "session",
         "version": CURRENT_SESSION_VERSION,
@@ -61,17 +65,17 @@ def make_session_header(session_id: str = None, cwd: str = None,
 
 def make_entry_base(entry_type: str, entry_id: str = None,
                     parent_id: str = None) -> dict:
-    """Create base fields shared by all entries."""
+    """创建所有记录共有的基础字段。"""
     return {
         "type": entry_type,
         "id": entry_id or _short_id(),
-        "parentId": parent_id,  # null/None for root entries
+        "parentId": parent_id,  # 根记录为 null/None
         "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime()),
     }
 
 
 def make_message_entry(message: dict, parent_id: str = None) -> dict:
-    """Create a message entry (user / assistant / tool_result)."""
+    """创建消息记录（用户 / 助手 / 工具结果）。"""
     entry = make_entry_base("message", parent_id=parent_id)
     entry["message"] = message
     return entry
@@ -80,7 +84,7 @@ def make_message_entry(message: dict, parent_id: str = None) -> dict:
 def make_compaction_entry(summary: str, first_kept_entry_id: str,
                           tokens_before: int, parent_id: str = None,
                           details: dict = None) -> dict:
-    """Create a compaction (context compression) entry."""
+    """创建压缩（上下文压缩）记录。"""
     entry = make_entry_base("compaction", parent_id=parent_id)
     entry["summary"] = summary
     entry["firstKeptEntryId"] = first_kept_entry_id
@@ -92,7 +96,7 @@ def make_compaction_entry(summary: str, first_kept_entry_id: str,
 
 def make_branch_summary_entry(from_id: str, summary: str,
                                parent_id: str = None) -> dict:
-    """Create a branch summary entry (records abandoned path context)."""
+    """创建分支摘要记录（记录被放弃的分支路径上下文）。"""
     entry = make_entry_base("branch_summary", parent_id=parent_id)
     entry["fromId"] = from_id
     entry["summary"] = summary
@@ -101,7 +105,7 @@ def make_branch_summary_entry(from_id: str, summary: str,
 
 def make_model_change_entry(provider: str, model_id: str,
                              parent_id: str = None) -> dict:
-    """Record a model switch."""
+    """记录一次模型切换。"""
     entry = make_entry_base("model_change", parent_id=parent_id)
     entry["provider"] = provider
     entry["modelId"] = model_id
@@ -110,7 +114,7 @@ def make_model_change_entry(provider: str, model_id: str,
 
 def make_label_entry(target_id: str, label: str = None,
                       parent_id: str = None) -> dict:
-    """User-defined bookmark/marker on an entry."""
+    """用户对某条记录定义的书签/标记。"""
     entry = make_entry_base("label", parent_id=parent_id)
     entry["targetId"] = target_id
     entry["label"] = label
@@ -119,7 +123,7 @@ def make_label_entry(target_id: str, label: str = None,
 
 def make_custom_entry(custom_type: str, data: Any = None,
                        parent_id: str = None) -> dict:
-    """Extension-specific data (NOT sent to LLM)."""
+    """扩展专用数据（不发送给 LLM）。"""
     entry = make_entry_base("custom", parent_id=parent_id)
     entry["customType"] = custom_type
     if data is not None:
@@ -130,7 +134,7 @@ def make_custom_entry(custom_type: str, data: Any = None,
 def make_custom_message_entry(custom_type: str, content: str,
                                display: bool = True, details: Any = None,
                                parent_id: str = None) -> dict:
-    """Extension-injected message (IS sent to LLM as user role)."""
+    """扩展注入的消息（会以用户角色发送给 LLM）。"""
     entry = make_entry_base("custom_message", parent_id=parent_id)
     entry["customType"] = custom_type
     entry["content"] = content
@@ -140,37 +144,72 @@ def make_custom_message_entry(custom_type: str, content: str,
     return entry
 
 
+def make_thought_chain_entry(chain_data: dict,
+                              parent_id: str = None) -> dict:
+    """创建思维链记录（CoT 推理过程）。"""
+    entry = make_entry_base("thought_chain", parent_id=parent_id)
+    entry.update(chain_data)
+    return entry
+
+
+def make_thinking_level_change_entry(level: str,
+                                      reason: str = None,
+                                      parent_id: str = None) -> dict:
+    """记录思维模式切换。"""
+    entry = make_entry_base("thinking_level_change", parent_id=parent_id)
+    entry["thinkingLevel"] = level
+    if reason:
+        entry["reason"] = reason
+    return entry
+
+
+def make_thought_tree_entry(tree_data: dict,
+                             parent_id: str = None) -> dict:
+    """创建思维树记录（ToT 搜索过程）。"""
+    entry = make_entry_base("thought_tree", parent_id=parent_id)
+    entry.update(tree_data)
+    return entry
+
+
+def make_thought_graph_entry(graph_data: dict,
+                              parent_id: str = None) -> dict:
+    """创建思维图记录（GoT 推理过程）。"""
+    entry = make_entry_base("thought_graph", parent_id=parent_id)
+    entry.update(graph_data)
+    return entry
+
+
 # ---------------------------------------------------------------------------
-# ID Generation
+# ID 生成
 # ---------------------------------------------------------------------------
 
 _existing_ids: set = set()
 
 
 def _short_id(length: int = 8) -> str:
-    """Generate a short unique hex ID (collision-checked)."""
+    """生成短唯一十六进制 ID（带冲突检查）。"""
     for _ in range(100):
         cid = uuid.uuid4().hex[:length]
         if cid not in _existing_ids:
             _existing_ids.add(cid)
             return cid
-    return uuid.uuid4().hex  # fallback
+        return uuid.uuid4().hex  # 兜底方案
 
 
 # ---------------------------------------------------------------------------
-# File I/O Helpers
+# 文件 I/O 辅助函数
 # ---------------------------------------------------------------------------
 
 
 def _encode_cwd(cwd: str) -> str:
-    """Encode working directory into a safe directory name."""
+    """将工作目录编码为安全的目录名。"""
     safe = cwd.replace("/", "-").replace("\\", "-").replace(":", "-")
     safe = safe.strip("-")
     return f"--{safe}--" if safe else "--root--"
 
 
 def _get_session_dir(cwd: str = None) -> Path:
-    """Get/create the session storage directory for a working directory."""
+    """获取或创建指定工作目录的会话存储目录。"""
     encoded = _encode_cwd(cwd or str(WORKDIR))
     dir_path = SESSIONS_DIR / encoded
     dir_path.mkdir(parents=True, exist_ok=True)
@@ -178,7 +217,7 @@ def _get_session_dir(cwd: str = None) -> Path:
 
 
 def _load_entries(filepath: Path) -> list:
-    """Parse a .jsonl file into list of entry dicts. Returns [] on error."""
+    """解析 .jsonl 文件为记录字典列表。出错时返回空列表。"""
     if not filepath.exists():
         return []
     entries = []
@@ -189,14 +228,14 @@ def _load_entries(filepath: Path) -> list:
                 entries.append(json.loads(line))
     except (json.JSONDecodeError, OSError):
         return []
-    # Validate header
+    # 验证文件头
     if entries and entries[0].get("type") != "session":
         return []
     return entries
 
 
 def _is_valid_session_file(filepath: Path) -> bool:
-    """Quick check: does this look like a valid session file?"""
+    """快速检查：这是否是一个有效的会话文件？"""
     try:
         first_line = filepath.open().readline().strip()
         if not first_line:
@@ -208,7 +247,7 @@ def _is_valid_session_file(filepath: Path) -> bool:
 
 
 def _find_most_recent_session(session_dir: Path) -> Optional[Path]:
-    """Find the most recently modified session file in a directory."""
+    """查找目录中最近修改的会话文件。"""
     if not session_dir.exists():
         return None
     candidates = []
@@ -222,25 +261,25 @@ def _find_most_recent_session(session_dir: Path) -> Optional[Path]:
 
 
 # ---------------------------------------------------------------------------
-# Session Manager
+# 会话管理器
 # ---------------------------------------------------------------------------
 
 
 class SessionManager:
     """
-    Tree-structured JSONL session manager.
+    树形 JSONL 会话管理器。
 
-    Manages conversation sessions as append-only trees stored in JSONL files.
-    Each entry has id/parentId forming a tree. The 'leaf' pointer tracks current
-    position. Appending creates a child of leaf. Branching moves leaf backward.
+    将对话会话管理为存储在 JSONL 文件中的只追加树形结构。
+    每条记录都有 id/parentId 形成树形结构。'leaf' 指针追踪当前
+    位置。追加操作在叶节点下创建子节点。分支操作将叶节点回移。
 
-    Usage:
-        sm = SessionManager.create()          # new session
-        sm.append_message(user_msg)           # add user msg
-        sm.append_message(assistant_msg)      # add assistant msg
-        sm.branch(entry_id)                   # go back in time
-        sm.append_message(new_user_msg)       # new branch!
-        ctx = sm.build_context()              # → flat list for LLM
+    使用方式：
+        sm = SessionManager.create()          # 新建会话
+        sm.append_message(user_msg)           # 添加用户消息
+        sm.append_message(assistant_msg)      # 添加助手消息
+        sm.branch(entry_id)                   # 回到之前的节点
+        sm.append_message(new_user_msg)       # 创建新分支！
+        ctx = sm.build_context()              # → 生成给 LLM 用的扁平列表
     """
 
     def __init__(self, cwd: str = None, session_dir: Path = None,
@@ -253,7 +292,7 @@ class SessionManager:
         if persist and not self.session_dir.exists():
             self.session_dir.mkdir(parents=True, exist_ok=True)
 
-        # Internal state
+        # 内部状态
         self._session_id: str = ""
         self._session_file: Optional[Path] = None
         self._file_entries: list[dict] = []
@@ -267,11 +306,11 @@ class SessionManager:
             self._new_session()
 
     # ------------------------------------------------------------------
-    # Session lifecycle
+    # 会话生命周期
     # ------------------------------------------------------------------
 
     def _new_session(self, session_id: str = None, parent_session: str = None):
-        """Initialize a brand new session."""
+        """初始化一个全新的会话。"""
         self._session_id = session_id or str(uuid.uuid4())
         header = make_session_header(
             session_id=self._session_id,
@@ -289,12 +328,12 @@ class SessionManager:
             self._session_file = self.session_dir / f"{ts}_{self._session_id}.jsonl"
 
     def _open_session(self, session_file: Path):
-        """Open an existing session file."""
+        """打开一个已有的会话文件。"""
         self._session_file = session_file.resolve()
         if session_file.exists():
             self._file_entries = _load_entries(session_file)
             if not self._file_entries:
-                # Corrupted/empty — start fresh at same path
+                # 已损坏或空文件 —— 在同一路径重新开始
                 self._new_session()
                 self._session_file = session_file.resolve()
                 self._rewrite_file()
@@ -304,9 +343,9 @@ class SessionManager:
             self._session_id = header.get("id", str(uuid.uuid4()))
             self._build_index()
             self.flushed = True
-            # Index all entries into FTS5 on open (best-effort)
+            # 打开时将所有记录索引到 FTS5（尽力而为）
             try:
-                from .search import SEARCH_INDEX
+                from ..data.search import SEARCH_INDEX
                 non_header = [e for e in self._file_entries if e.get("type") != "session"]
                 SEARCH_INDEX.index_entries(
                     non_header,
@@ -317,17 +356,17 @@ class SessionManager:
             except Exception:
                 pass
         else:
-            # New file at specified path
+            # 在指定路径创建新文件
             actual_path = session_file.resolve()
             self._new_session()
             self._session_file = actual_path
 
     # ------------------------------------------------------------------
-    # Index
+    # 索引
     # ------------------------------------------------------------------
 
     def _build_index(self):
-        """Rebuild by_id index and labels from file_entries."""
+        """从 file_entries 重建 by_id 索引和标签字典。"""
         self._by_id.clear()
         self._labels.clear()
         self._leaf_id = None
@@ -348,22 +387,22 @@ class SessionManager:
                         self._labels.pop(tid, None)
 
     # ------------------------------------------------------------------
-    # Persistence
+    # 持久化
     # ------------------------------------------------------------------
 
     def _rewrite_file(self):
-        """Write all entries to file (full rewrite)."""
+        """将所有记录写入文件（全量重写）。"""
         if not self.persist or not self._session_file:
             return
         lines = "\n".join(json.dumps(e, default=str) for e in self._file_entries)
         self._session_file.write_text(lines + "\n")
 
     def _append_to_file(self, entry: dict):
-        """Append a single entry to the JSONL file."""
+        """向 JSONL 文件追加单条记录。"""
         if not self.persist or not self._session_file:
             return
 
-        # Delay write until we have at least one assistant message
+        # 延迟写入，直到至少有一条助手消息
         has_assistant = any(
             e.get("type") == "message"
             and e.get("message", {}).get("role") == "assistant"
@@ -374,18 +413,18 @@ class SessionManager:
             return
 
         if not self.flushed:
-            # First flush: write everything
+            # 首次刷新：写入所有内容
             with open(self._session_file, "a") as f:
                 for e in self._file_entries:
                     f.write(json.dumps(e, default=str) + "\n")
             self.flushed = True
         else:
-            # Subsequent: append only new entry
+            # 后续：仅追加新记录
             with open(self._session_file, "a") as f:
                 f.write(json.dumps(entry, default=str) + "\n")
 
     # ------------------------------------------------------------------
-    # Properties
+    # 属性
     # ------------------------------------------------------------------
 
     @property
@@ -413,20 +452,20 @@ class SessionManager:
         return None
 
     # ------------------------------------------------------------------
-    # Append operations
+    # 追加操作
     # ------------------------------------------------------------------
 
     def _append_entry(self, entry: dict) -> str:
-        """Internal: add entry to memory + persist + index for search."""
+        """内部方法：将记录添加到内存 + 持久化 + 建立搜索索引。"""
         self._file_entries.append(entry)
         eid = entry.get("id", "")
         if eid:
             self._by_id[eid] = entry
         self._leaf_id = eid
         self._append_to_file(entry)
-        # Auto-index to FTS5 (non-critical: failure won't break session)
+        # 自动索引到 FTS5（非关键功能：索引失败不会影响会话）
         try:
-            from .search import SEARCH_INDEX
+            from ..data.search import SEARCH_INDEX
             SEARCH_INDEX.index_entry(
                 entry,
                 session_id=self._session_id,
@@ -434,17 +473,17 @@ class SessionManager:
                 cwd=self.cwd,
             )
         except Exception:
-            pass  # search index is best-effort
+            pass  # 搜索索引是尽力而为的，失败不影响主流程
         return eid
 
     def append_message(self, message: dict) -> str:
-        """Append a user/assistant/tool_result message. Returns entry ID."""
+        """追加用户/助手/工具结果消息。返回记录 ID。"""
         entry = make_message_entry(message, parent_id=self._leaf_id)
         return self._append_entry(entry)
 
     def append_compaction(self, summary: str, first_kept_entry_id: str,
                            tokens_before: int, details: dict = None) -> str:
-        """Append a compaction summary entry."""
+        """追加压缩摘要记录。"""
         entry = make_compaction_entry(
             summary, first_kept_entry_id, tokens_before,
             parent_id=self._leaf_id, details=details,
@@ -452,17 +491,17 @@ class SessionManager:
         return self._append_entry(entry)
 
     def append_branch_summary(self, from_id: str, summary: str) -> str:
-        """Append a branch summary (context from abandoned path)."""
+        """追加分支摘要（来自被放弃路径的上下文）。"""
         entry = make_branch_summary_entry(from_id, summary, parent_id=self._leaf_id)
         return self._append_entry(entry)
 
     def append_model_change(self, provider: str, model_id: str) -> str:
-        """Record a model change."""
+        """记录模型变更。"""
         entry = make_model_change_entry(provider, model_id, parent_id=self._leaf_id)
         return self._append_entry(entry)
 
     def append_label(self, target_id: str, label: str = None) -> str:
-        """Set/clear a bookmark label on an entry."""
+        """在某条记录上设置/清除书签标签。"""
         if target_id not in self._by_id:
             raise ValueError(f"Entry {target_id} not found")
         entry = make_label_entry(target_id, label, parent_id=self._leaf_id)
@@ -474,44 +513,66 @@ class SessionManager:
         return result_id
 
     def append_custom(self, custom_type: str, data: Any = None) -> str:
-        """Append extension data (not sent to LLM)."""
+        """追加扩展数据（不发送给 LLM）。"""
         entry = make_custom_entry(custom_type, data, parent_id=self._leaf_id)
         return self._append_entry(entry)
 
     def append_custom_message(self, custom_type: str, content: str,
                                display: bool = True, details: Any = None) -> str:
-        """Append extension message (injected into LLM context)."""
+        """追加扩展消息（注入到 LLM 上下文中）。"""
         entry = make_custom_message_entry(
             custom_type, content, display, details, parent_id=self._leaf_id)
         return self._append_entry(entry)
 
+    def append_thought_chain(self, chain_data: dict) -> str:
+        """追加思维链记录。"""
+        entry = make_thought_chain_entry(chain_data, parent_id=self._leaf_id)
+        return self._append_entry(entry)
+
+    def append_thinking_level_change(self, level: str,
+                                     reason: str = None) -> str:
+        """记录思维模式切换。"""
+        entry = make_thinking_level_change_entry(
+            level, reason, parent_id=self._leaf_id)
+        return self._append_entry(entry)
+
+    def append_thought_tree(self, tree_data: dict) -> str:
+        """追加思维树记录。"""
+        entry = make_thought_tree_entry(tree_data, parent_id=self._leaf_id)
+        return self._append_entry(entry)
+
+    def append_thought_graph(self, graph_data: dict) -> str:
+        """追加思维图记录。"""
+        entry = make_thought_graph_entry(graph_data, parent_id=self._leaf_id)
+        return self._append_entry(entry)
+
     # ------------------------------------------------------------------
-    # Tree traversal
+    # 树遍历
     # ------------------------------------------------------------------
 
     def get_entry(self, entry_id: str) -> Optional[dict]:
-        """Get entry by ID."""
+        """根据 ID 获取记录。"""
         return self._by_id.get(entry_id)
 
     def get_leaf_entry(self) -> Optional[dict]:
-        """Get the current leaf entry."""
+        """获取当前叶节点记录。"""
         if self._leaf_id:
             return self._by_id.get(self._leaf_id)
         return None
 
     def get_children(self, parent_id: str) -> list[dict]:
-        """Get direct children of an entry."""
+        """获取某条记录的直接子记录。"""
         return [e for e in self._by_id.values()
                 if e.get("parentId") == parent_id]
 
     def get_label(self, entry_id: str) -> Optional[str]:
-        """Get label for an entry."""
+        """获取某条记录的标签。"""
         return self._labels.get(entry_id)
 
     def get_branch(self, from_id: str = None) -> list[dict]:
         """
-        Walk from entry to root, returning ordered path (root→leaf).
-        If from_id is None, walks from current leaf.
+        从指定记录走到根节点，返回有序路径（根→叶）。
+        如果 from_id 为 None，则从当前叶节点开始走。
         """
         start_id = from_id or self._leaf_id
         path = []
@@ -523,12 +584,12 @@ class SessionManager:
         return path
 
     def get_entries(self) -> list[dict]:
-        """Return all entries except header."""
+        """返回除文件头外的所有记录。"""
         return [e for e in self._file_entries if e.get("type") != "session"]
 
     def get_tree(self) -> list[dict]:
         """
-        Return tree structure as nested dicts with 'entry' and 'children' keys.
+        将树结构返回为嵌套字典，包含 'entry' 和 'children' 键。
         """
         entries = self.get_entries()
         node_map: dict[str, dict] = {}
@@ -548,7 +609,7 @@ class SessionManager:
             else:
                 node_map[pid]["children"].append(node)
 
-        # Sort children by timestamp
+        # 按时间戳排序子节点
         def sort_children(nodes):
             nodes.sort(key=lambda n: n["entry"].get("timestamp", ""))
             for n in nodes:
@@ -558,21 +619,21 @@ class SessionManager:
         return roots
 
     # ------------------------------------------------------------------
-    # Branching
+    # 分支操作
     # ------------------------------------------------------------------
 
     def branch(self, branch_from_id: str):
         """
-        Move leaf pointer to an earlier entry (zero-copy!).
-        Next append will create a child of that entry → new branch.
-        Like `git checkout <commit>`.
+        将叶节点指针移动到更早的记录（零拷贝！）。
+        下次追加将在该记录下创建子节点 → 新分支。
+        类似 `git checkout <commit>`。
         """
         if branch_from_id not in self._by_id:
             raise ValueError(f"Entry {branch_from_id} not found")
         self._leaf_id = branch_from_id
 
     def branch_with_summary(self, branch_from_id: str, summary: str) -> str:
-        """Branch + record what was on the abandoned path."""
+        """分支 + 记录被放弃路径上的内容。"""
         if branch_from_id and branch_from_id not in self._by_id:
             raise ValueError(f"Entry {branch_from_id} not found")
         self._leaf_id = branch_from_id
@@ -580,30 +641,30 @@ class SessionManager:
             branch_from_id or "root", summary)
 
     def reset_leaf(self):
-        """Reset leaf to null (next append becomes root)."""
+        """重置叶节点为 null（下次追加将成为根节点）。"""
         self._leaf_id = None
 
     # ------------------------------------------------------------------
-    # Context building (tree → flat list for LLM)
+    # 上下文构建（树 → 给 LLM 用的扁平列表）
     # ------------------------------------------------------------------
 
     def build_context(self) -> dict:
         """
-        Build the flattened context for LLM consumption.
+        构建供 LLM 使用的扁平化上下文。
 
-        Walks from leaf to root, handling compaction and branch summaries.
+        从叶节点走到根节点，处理压缩和分支摘要。
 
-        Returns:
+        返回：
             {"messages": [...], "thinkingLevel": "...", "model": {...}|None}
         """
         entries = self.get_entries()
         if not entries:
             return {"messages": [], "thinkingLevel": "off", "model": None}
 
-        # Build index
+        # 构建索引
         by_id = self._by_id
 
-        # Find leaf
+        # 找到叶节点
         leaf = None
         if self._leaf_id is not None:
             leaf = by_id.get(self._leaf_id)
@@ -612,7 +673,7 @@ class SessionManager:
         if not leaf:
             return {"messages": [], "thinkingLevel": "off", "model": None}
 
-        # Walk leaf → root, collect path
+        # 从叶节点走到根节点，收集路径
         path = []
         current = leaf
         while current:
@@ -620,7 +681,7 @@ class SessionManager:
             pid = current.get("parentId")
             current = by_id.get(pid) if pid else None
 
-        # Extract settings along path
+        # 沿路径提取设置信息
         thinking_level = "off"
         model_info = None
         compaction_entry = None
@@ -637,7 +698,7 @@ class SessionManager:
             elif etype == "compaction":
                 compaction_entry = entry
 
-        # Build messages
+        # 构建消息列表
         messages = []
 
         def emit(entry):
@@ -656,9 +717,96 @@ class SessionManager:
                     "content": f"[Branch Summary - from {entry.get('fromId')}]\n{entry['summary']}",
                     "_meta": "branch_summary",
                 })
+            elif etype == "thought_chain":
+                # 思维链：作为压缩摘要注入上下文（可选）
+                # 只注入结论和关键步骤，避免占用过多 token
+                conclusion = entry.get("conclusion", "")
+                steps = entry.get("steps", [])
+                chain_goal = entry.get("goal", "")
+                if conclusion or steps:
+                    # 构建精简版思维链摘要
+                    step_summary = "\n".join([
+                        f"  - [{s.get('thought_type', '?')}] {s.get('content', '')[:100]}"
+                        for s in steps[:4]  # 最多 4 个步骤
+                    ])
+                    thought_text = (
+                        f"[Thought Chain] Goal: {chain_goal[:80]}\n"
+                        f"{step_summary}\n"
+                        f"Conclusion: {conclusion[:200]}"
+                    )
+                    messages.append({
+                        "role": "user",
+                        "content": thought_text,
+                        "_meta": "thought_chain",
+                    })
+            elif etype == "thought_tree":
+                # 思维树：注入最优路径摘要
+                conclusion = entry.get("conclusion", "")
+                best_path = entry.get("bestPath", [])
+                tree_goal = entry.get("goal", "")
+                strategy = entry.get("strategy", "?")
+                best_score = entry.get("bestScore", 0)
+                node_summary = entry.get("nodeSummary", [])
+                if conclusion or best_path:
+                    # 构建精简版思维树摘要（只显示最优路径）
+                    path_nodes = []
+                    for ns in node_summary:
+                        if ns.get("id") in best_path:
+                            path_nodes.append(
+                                f"  [D{ns.get('depth', '?')}] {ns.get('content', '')[:80]} "
+                                f"(score={ns.get('score', 0)})"
+                            )
+                    tot_text = (
+                        f"[Thought Tree ToT] Goal: {tree_goal[:80]}\n"
+                        f"Strategy: {strategy} | Best Score: {best_score:.2f}\n"
+                        f"Best Path ({len(best_path)} nodes):\n"
+                    )
+                    if path_nodes:
+                        tot_text += "\n".join(path_nodes[:6])
+                    else:
+                        tot_text += " → ".join([p[:30] for p in best_path[:5]])
+                    tot_text += f"\nConclusion: {conclusion[:200]}"
+                    messages.append({
+                        "role": "user",
+                        "content": tot_text,
+                        "_meta": "thought_tree",
+                    })
+            elif etype == "thought_graph":
+                # 思维图：注入关键发现和结论
+                conclusion = entry.get("conclusion", "")
+                graph_goal = entry.get("goal", "")
+                gmode = entry.get("mode", "?")
+                key_findings = entry.get("keyFindings", [])
+                node_summary = entry.get("nodeSummary", [])
+                if conclusion or key_findings:
+                    # 按深度分组显示关键节点
+                    by_depth = {}
+                    for ns in node_summary:
+                        d = ns.get("depth", 0)
+                        if d not in by_depth:
+                            by_depth[d] = []
+                        by_depth[d].append(
+                            f"  [{ns.get('type','?')}] {ns.get('content','')[:60]} "
+                            f"(score={ns.get('score',0)})"
+                        )
+                    got_text = (
+                        f"[Thought Graph GoT] Goal: {graph_goal[:80]}\n"
+                        f"Mode: {gmode} | Nodes: {entry.get('totalNodes',0)} | "
+                        f"Edges: {entry.get('totalEdges',0)}\n"
+                    )
+                    if key_findings:
+                        got_text += "Key Findings:\n" + \
+                                   "\n".join(f"  - {f}" for f in key_findings[:3]) + "\n"
+                    for d in sorted(by_depth.keys()):
+                        got_text += f"Depth {d}:\n" + "\n".join(by_depth[d][:3]) + "\n"
+                    got_text += f"Conclusion: {conclusion[:200]}"
+                    messages.append({
+                        "role": "user",
+                        "content": got_text,
+                        "_meta": "thought_graph",
+                    })
 
         if compaction_entry:
-            # Emit compaction summary first
             messages.append({
                 "role": "user",
                 "content": (
@@ -668,7 +816,7 @@ class SessionManager:
                 "_meta": "compaction",
             })
 
-            # Find compaction position in path
+            # 在路径中找到压缩位置
             comp_idx = None
             for i, e in enumerate(path):
                 if e.get("id") == compaction_entry.get("id"):
@@ -676,7 +824,7 @@ class SessionManager:
                     break
 
             kept_id = compaction_entry.get("firstKeptEntryId")
-            # Emit messages before compaction starting from firstKeptEntryId
+            # 从 firstKeptEntryId 开始输出压缩前的消息
             if comp_idx is not None:
                 keeping = False
                 for i in range(comp_idx):
@@ -684,11 +832,11 @@ class SessionManager:
                         keeping = True
                     if keeping:
                         emit(path[i])
-                # Emit messages after compaction
+                # 输出压缩后的消息
                 for i in range(comp_idx + 1, len(path)):
                     emit(path[i])
         else:
-            # No compaction — emit all message-type entries
+            # 无压缩 —— 输出所有消息类型记录
             for entry in path:
                 emit(entry)
 
@@ -699,17 +847,17 @@ class SessionManager:
         }
 
     # ------------------------------------------------------------------
-    # Session listing
+    # 会话列表
     # ------------------------------------------------------------------
 
     @staticmethod
     def create(cwd: str = None, session_dir: Path = None) -> "SessionManager":
-        """Factory: create a new session."""
+        """工厂方法：创建新会话。"""
         return SessionManager(cwd=cwd, session_dir=session_dir, persist=True)
 
     @staticmethod
     def open_session(filepath: str | Path) -> "SessionManager":
-        """Factory: open an existing session file."""
+        """工厂方法：打开已有会话文件。"""
         p = Path(filepath)
         # Try to extract cwd from header
         entries = _load_entries(p)
@@ -720,7 +868,7 @@ class SessionManager:
 
     @staticmethod
     def continue_recent(cwd: str = None) -> "SessionManager":
-        """Factory: continue most recent session, or create new."""
+        """工厂方法：继续最近的会话，或创建新会话。"""
         sdir = _get_session_dir(cwd)
         recent = _find_most_recent_session(sdir)
         if recent:
@@ -729,12 +877,12 @@ class SessionManager:
 
     @staticmethod
     def in_memory(cwd: str = None) -> "SessionManager":
-        """Factory: create in-memory session (no persistence)."""
+        """工厂方法：创建内存会话（不持久化）。"""
         return SessionManager(cwd=cwd, persist=False)
 
     @staticmethod
     def list_sessions(cwd: str = None) -> list[dict]:
-        """List all sessions for a working directory."""
+        """列出指定工作目录下的所有会话。"""
         sdir = _get_session_dir(cwd)
         if not sdir.exists():
             return []
@@ -760,7 +908,7 @@ class SessionManager:
                             if isinstance(part, dict) and part.get("type") == "text":
                                 first_msg = part.get("text", "")[:80]
                                 break
-                                break
+                        break  # 修正缩进：外层循环也需要 break
             sessions.append({
                 "path": str(f),
                 "id": header.get("id", "?"),
@@ -775,19 +923,19 @@ class SessionManager:
 
     @staticmethod
     def list_all_sessions() -> list[dict]:
-        """List sessions across ALL working directories."""
+        """列出所有工作目录下的会话。"""
         if not SESSIONS_DIR.exists():
             return []
         all_sessions = []
         for d in sorted(SESSIONS_DIR.iterdir()):
             if d.is_dir():
                 all_sessions.extend(SessionManager.list_sessions(cwd=None))
-                # Fix: list_sessions uses _get_session_dir which encodes cwd,
-                # but here we want each subdir. Let's just scan directly.
-                all_sessions = []  # reset, redo properly
+                # 修正：list_sessions 使用 _get_session_dir 会编码 cwd，
+                # 但这里我们需要每个子目录。直接扫描即可。
+                all_sessions = []  # 重置，重新正确实现
                 break
 
-        # Proper implementation
+        # 正确的实现
         if SESSIONS_DIR.exists():
             for subdir in sorted(SESSIONS_DIR.iterdir()):
                 if subdir.is_dir():
@@ -814,26 +962,26 @@ class SessionManager:
         return all_sessions
 
     # ------------------------------------------------------------------
-    # FTS5 Full-Text Search Integration
+    # FTS5 全文搜索集成
     # ------------------------------------------------------------------
 
     def search(self, query: str, limit: int = 20,
                entry_type: str = None, role: str = None) -> list[dict]:
         """
-        Search within this session using SQLite FTS5.
+        使用 SQLite FTS5 在当前会话中搜索。
 
-        Args:
-            query: FTS5 search expression (supports AND/OR/NOT, phrase, prefix*)
-            limit: max results
-            entry_type: filter by type (message, compaction, ...)
-            role: filter by message role (user, assistant)
+        参数：
+            query: FTS5 搜索表达式（支持 AND/OR/NOT、短语、前缀通配符*）
+            limit: 最大返回结果数
+            entry_type: 按类型过滤（message、compaction 等）
+            role: 按消息角色过滤（user、assistant）
 
-        Returns:
-            List of result dicts with entry_id, snippet (highlighted),
-            rank, timestamp, etc.
+        返回：
+            结果字典列表，包含 entry_id、snippet（高亮）、
+            rank、时间戳等字段。
         """
         try:
-            from .search import SEARCH_INDEX
+            from ..data.search import SEARCH_INDEX
             return SEARCH_INDEX.search(
                 query=query,
                 limit=limit,
@@ -846,9 +994,9 @@ class SessionManager:
             return [{"error": f"Search error: {e}"}]
 
     def rebuild_search_index(self) -> str:
-        """Rebuild the FTS5 index for this session."""
+        """重建当前会话的 FTS5 索引。"""
         try:
-            from .search import SEARCH_INDEX
+            from ..data.search import SEARCH_INDEX
             return SEARCH_INDEX.rebuild_index(session_manager=self)
         except Exception as e:
             return f"Rebuild failed: {e}"
@@ -857,18 +1005,18 @@ class SessionManager:
     def global_search(query: str, limit: int = 20,
                       cwd: str = None) -> list[dict]:
         """
-        Search across ALL sessions using FTS5.
+        使用 FTS5 搜索所有会话。
 
-        Args:
-            query: FTS5 search expression
-            limit: max results per category
-            cwd: optional filter by working directory
+        参数：
+            query: FTS5 搜索表达式
+            limit: 每类最大返回结果数
+            cwd: 可选的工作目录过滤
 
-        Returns:
-            Dict with 'entries' and 'sessions' keys.
+        返回：
+            包含 'entries' 和 'sessions' 键的字典。
         """
         try:
-            from .search import SEARCH_INDEX
+            from ..data.search import SEARCH_INDEX
             entries = SEARCH_INDEX.search(
                 query=query, limit=limit, cwd=cwd
             )
@@ -880,18 +1028,18 @@ class SessionManager:
 
     @staticmethod
     def search_stats() -> dict:
-        """Return statistics about the search index."""
+        """返回搜索索引的统计信息。"""
         try:
-            from .search import SEARCH_INDEX
+            from ..data.search import SEARCH_INDEX
             return SEARCH_INDEX.get_stats()
         except Exception as e:
             return {"error": str(e)}
 
     @staticmethod
     def rebuild_global_search_index() -> str:
-        """Rebuild the entire search index from all JSONL files."""
+        """从所有 JSONL 文件重建整个搜索索引。"""
         try:
-            from .search import SEARCH_INDEX
+            from ..data.search import SEARCH_INDEX
             return SEARCH_INDEX.rebuild_index()
         except Exception as e:
             return f"Global rebuild failed: {e}"

@@ -6,7 +6,7 @@ import threading
 import uuid
 from queue import Queue
 
-from .config import WORKDIR
+from ..core.config import WORKDIR
 
 
 class BackgroundManager:

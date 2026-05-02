@@ -2,9 +2,8 @@
 """File-based Task Manager (s07) - persistent task tracking with dependencies."""
 
 import json
-from pathlib import Path
 
-from .config import TASKS_DIR
+from ..core.config import TASKS_DIR
 
 
 class TaskManager:

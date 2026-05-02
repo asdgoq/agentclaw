@@ -5,11 +5,9 @@ All functions run git commands via subprocess and return formatted output.
 Designed to be registered as LLM-callable tools in s_full.py.
 """
 
-import json
 import subprocess
-from pathlib import Path
 
-from .config import WORKDIR
+from ..core.config import WORKDIR
 
 
 def _git(*args: str, timeout: int = 30) -> subprocess.CompletedProcess:

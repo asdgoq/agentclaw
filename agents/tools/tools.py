@@ -3,7 +3,7 @@
 
 from pathlib import Path
 
-from .config import WORKDIR
+from ..core.config import WORKDIR
 
 
 def safe_path(p: str) -> Path:

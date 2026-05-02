@@ -3,9 +3,8 @@
 
 import json
 import time
-from pathlib import Path
 
-from .config import INBOX_DIR
+from ..core.config import INBOX_DIR
 
 # Global registries for shutdown handshake and plan approval
 shutdown_requests = {}

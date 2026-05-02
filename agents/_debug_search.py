@@ -6,7 +6,7 @@ import sys
 
 sys.path.insert(0, '.')
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from agents.search import _get_db_path, _tokenize_for_search, _tokenize_for_index, _contains_cjk
+from agents.data.search import _get_db_path, _tokenize_for_search, _tokenize_for_index, _contains_cjk
 
 db = _get_db_path()
 conn = sqlite3.connect(str(db))

@@ -1,37 +1,37 @@
 #!/usr/bin/env python3
 """
-SQLite FTS5 Full-Text Search Index for Session Entries.
+SQLite FTS5 全文搜索引擎索引（用于会话条目）。
 
-Architecture:
-  - JSONL (session.py)  → primary storage (tree structure, append-only)
-  - SQLite FTS5 (this)   → search index (content index, fast queries)
+架构：
+  - JSONL（session.py）→ 主存储（树形结构，仅追加）
+  - SQLite FTS5（本模块）→ 搜索索引（内容索引，快速查询）
 
-Why both?
-  - JSONL is great for: tree ops, branching, compaction, human-readable
-  - SQLite FTS5 is great for: cross-session search, keyword matching,
-    ranking by relevance, prefix/phrase queries
-  - jieba: Chinese text segmentation (FTS5's built-in tokenizer can't handle CJK)
+为什么需要两者？
+  - JSONL 擅长：树形操作、分支、压缩、人类可读
+  - SQLite FTS5 擅长：跨会话搜索、关键词匹配、
+    按相关性排序、前缀/短语查询
+  - jieba：中文分词（FTS5 内置分词器无法处理 CJK 字符）
 
-Data flow:
-  1. SessionManager.append_message() → writes to JSONL
-  2. SearchIndex._tokenize_for_index() → jieba segments Chinese text
-  3. SearchIndex.index_entry()       → inserts tokenized content into FTS5
-  4. User searches                   → jieba segments query → FTS5 MATCH → ranked results
+数据流：
+  1. SessionManager.append_message() → 写入 JSONL
+  2. SearchIndex._tokenize_for_index() → jieba 对中文分词
+  3. SearchIndex.index_entry()       → 将分词后的内容插入 FTS5
+  4. 用户搜索                       → jieba 对查询分词 → FTS5 MATCH → 排序结果
 
-FTS5 table schema:
+FTS5 表结构：
   CREATE VIRTUAL TABLE session_fts USING fts5(
       entry_id, session_id, session_file, entry_type, role,
       content, cwd, timestamp, parent_id,
-      tokenize='unicode61'   -- basic Unicode; heavy lifting done by jieba in Python
+      tokenize='unicode61'   -- 基础 Unicode 分词；重活由 Python 中的 jieba 完成
   );
 
-Chinese tokenization strategy:
-  - On INDEX:  jieba.lcut(text) → join tokens with spaces → store in FTS5
-  - On SEARCH: jieba.lcut(query) → join with AND → FTS5 MATCH expression
-  - English text passes through unchanged (spaces already separate words)
+中文分词策略：
+  - 索引时：jieba.lcut(text) → 用空格连接分词 → 存入 FTS5
+  - 搜索时：jieba.lcut(query) → 用 AND 连接 → FTS5 MATCH 表达式
+  - 英文原文不变（空格已分隔单词）
 
-DB location:
-  <SESSIONS_DIR>/.search.db   (alongside the .jsonl files)
+数据库位置：
+  <SESSIONS_DIR>/.search.db   （与 .jsonl 文件同目录）
 """
 
 from __future__ import annotations
@@ -43,13 +43,13 @@ import threading
 from pathlib import Path
 from typing import Optional, Union
 
-from .config import SESSIONS_DIR
+from ..core.config import SESSIONS_DIR
 
-# Lazy-load jieba (only when actually used for Chinese tokenization)
+# 延迟加载 jieba（仅在真正需要中文分词时才加载）
 _jieba = None
 
 def _get_jieba():
-    """Lazy-load jieba to avoid slow import at module level."""
+    """延迟加载 jieba，避免模块级导入时的性能开销。"""
     global _jieba
     if _jieba is None:
         import logging
@@ -72,25 +72,25 @@ def _get_jieba():
     return _jieba
 
 # ---------------------------------------------------------------------------
-# Constants
+# 常量
 # ---------------------------------------------------------------------------
 
 _SEARCH_DB_NAME = ".search.db"
 _FTS_TABLE = "session_fts"
 
-# Singleton connection with thread safety
+# 线程安全的单例连接
 _lock = threading.Lock()
 _conn: Optional[sqlite3.Connection] = None
 _db_path: Optional[Path] = None
 
 
 # ---------------------------------------------------------------------------
-# Database Connection Management
+# 数据库连接管理
 # ---------------------------------------------------------------------------
 
 
 def _get_db_path() -> Path:
-    """Get the path to the search database."""
+    """获取搜索数据库的路径。"""
     global _db_path
     if _db_path is None:
         _db_path = SESSIONS_DIR / _SEARCH_DB_NAME
@@ -99,24 +99,24 @@ def _get_db_path() -> Path:
 
 def _get_connection() -> sqlite3.Connection:
     """
-    Get or create the SQLite connection (thread-safe singleton).
-    Creates the FTS5 table on first use.
+    获取或创建 SQLite 连接（线程安全单例）。
+    首次使用时创建 FTS5 表。
     """
     global _conn, _db_path
     with _lock:
         if _conn is None:
             db_path = _get_db_path()
-            # Ensure parent directory exists
+            # 确保父目录存在
             db_path.parent.mkdir(parents=True, exist_ok=True)
 
             _conn = sqlite3.connect(str(db_path))
             _conn.row_factory = sqlite3.Row
 
-            # Enable WAL mode for better concurrent read performance
+            # 启用 WAL 模式以提升并发读取性能
             _conn.execute("PRAGMA journal_mode=WAL")
             _conn.execute("PRAGMA synchronous=NORMAL")
 
-            # Create FTS5 virtual table if not exists
+            # 如果不存在则创建 FTS5 虚拟表
             _conn.execute(f"""
                 CREATE VIRTUAL TABLE IF NOT EXISTS {_FTS_TABLE} USING fts5(
                     entry_id,
@@ -137,7 +137,7 @@ def _get_connection() -> sqlite3.Connection:
 
 
 def close_search_db():
-    """Close the search database connection."""
+    """关闭搜索数据库连接。"""
     global _conn
     with _lock:
         if _conn is not None:
@@ -146,71 +146,71 @@ def close_search_db():
 
 
 # ---------------------------------------------------------------------------
-# Chinese Tokenization (jieba)
+# 中文分词（jieba）
 # ---------------------------------------------------------------------------
 
 
-# Regex to detect CJK characters (Chinese/Japanese/Korean)
+# 检测 CJK 字符（中文/日文/韩文）的正则表达式
 _CJK_RE = re.compile(r'[\u4e00-\u9fff\u3400-\u4dbf\uf900-\ufaff]')
 
 
 def _contains_cjk(text: str) -> bool:
-    """Check if text contains any CJK (Chinese) characters."""
+    """检查文本是否包含 CJK（中文）字符。"""
     return bool(_CJK_RE.search(text))
 
 
 def _tokenize_for_index(text: str) -> str:
     """
-    Tokenize text for FTS5 indexing.
+    对文本进行 FTS5 索引分词。
 
-    Strategy:
-      - If text contains CJK: use jieba to segment, join tokens with spaces.
-        This lets FTS5 index each Chinese word as a separate token.
-      - If text is English-only: return as-is (FTS5 handles space-separated words).
-      - For mixed content: segment the whole thing with jieba.
+    策略：
+      - 如果文本包含 CJK：使用 jieba 分词，用空格连接。
+        这样 FTS5 可以将每个中文词作为独立索引词。
+      - 如果是纯英文：原样返回（FTS5 可处理空格分隔的单词）。
+      - 中英混合内容：整体使用 jieba 分词。
 
-    Examples:
+    示例：
       'SQLite FTS5 全文搜索' → 'SQLite FTS5 全文 搜索'
       '树形JSONL会话管理'   → '树形 JSONL 会话 管理'
-      'hello world'         → 'hello world' (unchanged)
+      'hello world'         → 'hello world'（不变）
     """
     if not text:
         return text
     if not _contains_cjk(text):
-        return text  # English only, no need to tokenize
+        return text  # 纯英文，无需分词
 
     jb = _get_jieba()
-    # Use cut_for_search mode for better recall in search scenarios
+    # 使用 cut_for_search 模式以获得更好的搜索召回率
     tokens = jb.cut_for_search(text)
-    # Filter: keep meaningful tokens (skip single punctuation, spaces)
+    # 过滤：保留有意义的词元（跳过单个标点、空格）
     filtered = [t.strip() for t in tokens if t.strip() and len(t.strip()) > 0]
     return " ".join(filtered)
 
 
 def _tokenize_for_search(query: str) -> str:
     """
-    Tokenize a user's search query for FTS5 MATCH expression.
+    对用户搜索查询进行 FTS5 MATCH 表达式分词。
 
-    Strategy:
-      - If query contains CJK: use jieba to segment, join with AND.
-        This ensures all Chinese terms must match (high precision).
-      - If query looks like an advanced FTS5 expression (has AND/OR/NOT/"),
-        pass it through unchanged (user knows what they're doing).
-      - Simple English: pass through or wrap in quotes for phrase matching.
+    策略：
+      - 如果查询包含 CJK：使用 jieba 分词，用 AND 连接。
+        确保所有中文词都必须匹配（高精度）。
+      - 如果查询看起来像高级 FTS5 表达式（含 AND/OR/NOT），
+        原样返回（用户知道自己在做什么）。
+      - 简单英文查询：原样返回或加引号进行短语匹配。
 
-    Examples:
+    示例：
       '全文搜索'       → '全文 AND 搜索'
       '会话管理'       → '会话 AND 管理'
-      'session AND branch' → 'session AND branch' (unchanged)
-      'SQLite FTS5'     → '"SQLite FTS5"' (phrase)
+      'session AND branch' → 'session AND branch'（不变）
+      'SQLite FTS5'     → '"SQLite FTS5"'（短语匹配）
     """
     if not query:
         return query
 
-    # If query already contains FTS5 operators, respect user intent
+    # 如果查询已含 FTS5 操作符，尊重用户意图
     fts5_ops = re.compile(r'\b(AND|OR|NOT|NEAR)\b|[()*"]')
     if fts5_ops.search(query):
-        # Still try to tokenize CJK parts within the expression
+        # 仍尝试对表达式中的 CJK 部分进行分词
         if _contains_cjk(query):
             jb = _get_jieba()
             tokens = jb.lcut(query)
@@ -219,28 +219,28 @@ def _tokenize_for_search(query: str) -> str:
             return and_joined
         return query
 
-    # Simple query: tokenize and join with AND for precision
+    # 简单查询：分词并用 AND 连接以确保精度
     if _contains_cjk(query):
         jb = _get_jieba()
         tokens = jb.lcut(query)
-        # Join Chinese tokens with AND for precise matching
+        # 中文词元用 AND 连接以实现精确匹配
         and_joined = " AND ".join(f'"{t}"' if _contains_cjk(t) else t
                                for t in tokens if t.strip())
         return and_joined
 
-    # Pure English simple query: phrase match
+    # 纯英文简单查询：短语匹配
     return f'"{query}"'
 
 
 # ---------------------------------------------------------------------------
-# Content Extraction Helpers
+# 内容提取辅助函数
 # ---------------------------------------------------------------------------
 
 
 def _extract_text_from_message(message: dict) -> tuple[str, str]:
     """
-    Extract searchable text and role from a message dict.
-    Returns (text_content, role).
+    从消息字典中提取可搜索的文本和角色。
+    返回 (text_content, role)。
     """
     role = message.get("role", "")
     content = message.get("content", "")
@@ -248,7 +248,7 @@ def _extract_text_from_message(message: dict) -> tuple[str, str]:
     if isinstance(content, str):
         return content, role
     elif isinstance(content, list):
-        # Content blocks (e.g., Anthropic format)
+        # 内容块（如 Anthropic 格式）
         parts = []
         for block in content:
             if isinstance(block, dict):
@@ -265,8 +265,8 @@ def _extract_text_from_message(message: dict) -> tuple[str, str]:
 
 def _extract_searchable_text(entry: dict) -> tuple[str, str]:
     """
-    Extract searchable text and role from any entry type.
-    Returns (text_content, role).
+    从任意类型的条目中提取可搜索文本和角色。
+    返回 (text_content, role)。
     """
     etype = entry.get("type", "")
 
@@ -292,28 +292,28 @@ def _extract_searchable_text(entry: dict) -> tuple[str, str]:
         ctype = entry.get("customType", "")
         return f"[{ctype}] {json.dumps(data, default=str)[:300] if data else ''}", "custom"
     else:
-        # Fallback: dump entire entry as text (truncated)
+        # 兜底：将整个条目转为文本（截断）
         return json.dumps(entry, default=str)[:500], etype or "unknown"
 
 
 # ---------------------------------------------------------------------------
-# Index Operations
+# 索引操作
 # ---------------------------------------------------------------------------
 
 
 class SearchIndex:
     """
-    Manages the SQLite FTS5 search index for session entries.
+    管理 SQLite FTS5 会话条目搜索索引。
 
-    Usage:
+    用法：
         idx = SearchIndex()
         idx.index_entry(entry, session_id, session_file, cwd)
         results = idx.search("keyword")
-        idx.remove_session(session_id)   # cleanup on delete
+        idx.remove_session(session_id)   # 删除时清理
     """
 
     def __init__(self, db_path: Union[str, Path] = None):
-        self._local_db_path = db_path  # for testing; normally use singleton
+        self._local_db_path = db_path  # 用于测试；通常使用单例
 
     def _conn(self) -> sqlite3.Connection:
         if self._local_db_path:
@@ -323,7 +323,7 @@ class SearchIndex:
             conn = sqlite3.connect(str(_p))
             conn.row_factory = sqlite3.Row
             conn.execute("PRAGMA journal_mode=WAL")
-            # Ensure FTS5 table exists for local connections too
+            # 确保本地连接也有 FTS5 表
             conn.execute(f"""
                 CREATE VIRTUAL TABLE IF NOT EXISTS {_FTS_TABLE} USING fts5(
                     entry_id, session_id, session_file, entry_type, role,
@@ -337,8 +337,8 @@ class SearchIndex:
     def index_entry(self, entry: dict, session_id: str,
                     session_file: Union[str, Path], cwd: str):
         """
-        Add or update an entry in the FTS5 index.
-        Called automatically by SessionManager after each append.
+        在 FTS5 索引中添加或更新一条记录。
+        由 SessionManager 在每次追加后自动调用。
         """
         eid = entry.get("id", "")
         if not eid:
@@ -346,14 +346,14 @@ class SearchIndex:
 
         etype = entry.get("type", "")
         content_text, role = _extract_searchable_text(entry)
-        # Tokenize Chinese text with jieba before storing in FTS5
+        # 存入 FTS5 前先用 jieba 对中文分词
         content_text = _tokenize_for_index(content_text)
         timestamp = entry.get("timestamp", "")
         parent_id = entry.get("parentId") or ""
 
         conn = self._conn()
         try:
-            # FTS5 uses INSERT OR REPLACE for upsert semantics
+            # FTS5 使用 INSERT OR REPLACE 实现更新或插入语义
             conn.execute(
                 f"INSERT OR REPLACE INTO {_FTS_TABLE} "
                 "(entry_id, session_id, session_file, entry_type, role, "
@@ -373,14 +373,14 @@ class SearchIndex:
             )
             conn.commit()
         except Exception:
-            pass  # non-critical: search index failure shouldn't break session
+            pass  # 非关键错误：搜索索引失败不应中断会话
         finally:
             if self._local_db_path:
                 conn.close()
 
     def index_entries(self, entries: list[dict], session_id: str,
                       session_file: Union[str, Path], cwd: str):
-        """Bulk-index multiple entries (used for initial indexing)."""
+        """批量索引多条记录（用于初始建索引）。"""
         conn = self._conn()
         try:
             for entry in entries:
@@ -389,7 +389,7 @@ class SearchIndex:
                     continue
                 etype = entry.get("type", "")
                 content_text, role = _extract_searchable_text(entry)
-                # Tokenize Chinese text with jieba before storing in FTS5
+                # 存入 FTS5 前先用 jieba 对中文分词
                 content_text = _tokenize_for_index(content_text)
                 timestamp = entry.get("timestamp", "")
                 parent_id = entry.get("parentId") or ""
@@ -410,7 +410,7 @@ class SearchIndex:
                 conn.close()
 
     def remove_entry(self, entry_id: str):
-        """Remove a single entry from the index."""
+        """从索引中移除单条记录。"""
         conn = self._conn()
         try:
             conn.execute(
@@ -425,7 +425,7 @@ class SearchIndex:
                 conn.close()
 
     def remove_session(self, session_id: str):
-        """Remove all entries for a session from the index."""
+        """从索引中移除某个会话的所有记录。"""
         conn = self._conn()
         try:
             conn.execute(
@@ -440,46 +440,46 @@ class SearchIndex:
                 conn.close()
 
     # ------------------------------------------------------------------
-    # Search Queries
+    # 搜索查询
     # ------------------------------------------------------------------
 
     def search(self, query: str, limit: int = 20,
                session_id: str = None, cwd: str = None,
                entry_type: str = None, role: str = None) -> list[dict]:
         """
-        Full-text search across indexed session entries.
+        对已索引的会话条目进行全文搜索。
 
-        Args:
-            query: FTS5 search expression (supports AND, OR, NOT, phrase "*",
-                   prefix "prefix*", NEAR operator)
-            limit: max results to return
-            session_id: filter to specific session
-            cwd: filter to working directory
-            entry_type: filter by entry type (message, compaction, etc.)
-            role: filter by message role (user, assistant)
+        参数：
+            query: FTS5 搜索表达式（支持 AND、OR、NOT、短语 "*"、
+                  前缀 "prefix*"、NEAR 操作符）
+            limit: 最大返回结果数
+            session_id: 过滤指定会话
+            cwd: 过滤工作目录
+            entry_type: 按条目类型过滤（message、compaction 等）
+            role: 按消息角色过滤（user、assistant）
 
-        Returns:
-            List of result dicts with keys:
+        返回：
+            结果字典列表，包含以下键：
                 entry_id, session_id, session_file, entry_type, role,
-                content (snippet/highlighted), cwd, timestamp, parent_id,
-                rank (relevance score, lower = more relevant)
+                content（摘要/高亮）、cwd, timestamp, parent_id,
+                rank（相关性得分，越低越相关）
 
-        Example queries:
-            "SQLite FTS5"           — phrase match
+        示例查询：
+            "SQLite FTS5"           — 短语匹配
             "session AND branch"    — AND
             "session OR branch"     — OR
             "session NOT branch"    — NOT
-            "compac*"               — prefix match
-            'NEAR("session" "search")'  — proximity
+            "compac*"               — 前缀匹配
+            'NEAR("session" "search")'  — 近邻查询
         """
         conn = self._conn()
         try:
-            # Build WHERE clause dynamically
+            # 动态构建 WHERE 子句
             conditions = []
             params: list = []
 
             conditions.append(f"{_FTS_TABLE} MATCH ?")
-            # Tokenize Chinese query with jieba for better CJK search
+            # 使用 jieba 对中文查询分词以改善 CJK 搜索效果
             fts_query = _tokenize_for_search(query)
             params.append(fts_query)
 
@@ -498,7 +498,7 @@ class SearchIndex:
 
             where_clause = " AND ".join(conditions)
 
-            # Use bm25() for ranking (built-in FTS5 function)
+            # 使用 bm25() 排序（FTS5 内置函数）
             sql = f"""
                 SELECT
                     entry_id,
@@ -540,7 +540,7 @@ class SearchIndex:
                 })
             return results
         except sqlite3.OperationalError as e:
-            # Common issue: invalid FTS5 query syntax
+            # 常见问题：无效的 FTS5 查询语法
             if "fts5:" in str(e).lower():
                 return [{"error": f"Invalid search syntax: {e}"}]
             raise
@@ -550,15 +550,15 @@ class SearchIndex:
 
     def search_sessions(self, query: str, limit: int = 10) -> list[dict]:
         """
-        Search across sessions, returning one best match per session.
-        Useful for "which session was I talking about X?" queries.
+        跨会话搜索，每个会话返回最佳匹配结果。
+        适用于「我在哪个会话聊过 X？」这类查询。
 
-        Note: FTS5's bm25() cannot be used in subqueries or GROUP BY context,
-        so we use a two-step approach: get raw matches first, then aggregate in Python.
+        注意：FTS5 的 bm25() 不能在子查询或 GROUP BY 中使用，
+        所以采用两步法：先获取原始匹配，再在 Python 中聚合。
         """
         conn = self._conn()
         try:
-            # Step 1: Get all matching entries with bm25 rank
+            # 步骤1：获取所有匹配记录及其 bm25 排名
             entry_sql = f"""
                 SELECT
                     session_id, session_file, cwd, entry_type,
@@ -573,7 +573,7 @@ class SearchIndex:
             if not rows:
                 return []
 
-            # Step 2: Aggregate by session_id in Python
+            # 步骤2：在 Python 中按 session_id 聚合
             from collections import defaultdict
             session_map: dict[str, dict] = {}
             for row in rows:
@@ -594,13 +594,13 @@ class SearchIndex:
                 if row["entry_type"]:
                     s["types"].add(row["entry_type"])
 
-            # Sort by best_rank, then match_count, and limit
+            # 按 best_rank 和 match_count 排序并截取
             results = sorted(
                 session_map.values(),
                 key=lambda x: (x["best_rank"], -x["match_count"]),
             )[:limit]
 
-            # Convert sets to strings for output
+            # 将集合转为字符串以便输出
             for r in results:
                 r["types"] = ",".join(sorted(r["types"]))
 
@@ -614,19 +614,19 @@ class SearchIndex:
                 conn.close()
 
     # ------------------------------------------------------------------
-    # Maintenance
+    # 维护操作
     # ------------------------------------------------------------------
 
     def rebuild_index(self, session_manager=None):
         """
-        Rebuild the entire search index from JSONL files.
-        If session_manager is given, only re-index that session.
-        Otherwise, re-index ALL sessions.
+        从 JSONL 文件重建整个搜索索引。
+        如果指定了 session_manager，只重建该会话的索引。
+        否则重建所有会话的索引。
         """
         conn = self._conn()
         try:
             if session_manager:
-                # Re-index single session
+                # 重建单个会话的索引
                 self.remove_session(session_manager.session_id)
                 entries = session_manager.get_entries()
                 self.index_entries(
@@ -636,7 +636,7 @@ class SearchIndex:
                     session_manager.cwd,
                 )
             else:
-                # Re-index everything: clear + scan all JSONL files
+                # 全量重建：清空 + 扫描所有 JSONL 文件
                 conn.execute(f"DELETE FROM {_FTS_TABLE}")
                 conn.commit()
 
@@ -667,7 +667,7 @@ class SearchIndex:
         return "Search index rebuilt."
 
     def get_stats(self) -> dict:
-        """Return statistics about the search index."""
+        """返回搜索索引的统计信息。"""
         conn = self._conn()
         try:
             total = conn.execute(
@@ -708,12 +708,12 @@ class SearchIndex:
 
 
 # ---------------------------------------------------------------------------
-# Utilities
+# 工具函数
 # ---------------------------------------------------------------------------
 
 
 def _format_size(size_bytes: int) -> str:
-    """Format byte count as human-readable string."""
+    """将字节数格式化为人类可读字符串。"""
     for unit in ("B", "KB", "MB", "GB"):
         if abs(size_bytes) < 1024:
             return f"{size_bytes:.1f} {unit}"
@@ -722,7 +722,7 @@ def _format_size(size_bytes: int) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Global convenience instance
+# 全局便捷实例
 # ---------------------------------------------------------------------------
 
 SEARCH_INDEX = SearchIndex()

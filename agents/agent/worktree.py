@@ -1,20 +1,20 @@
 #!/usr/bin/env python3
-"""Worktree Manager (from s12, adapted for s_full integration).
+"""Worktree 管理器（来自 s12，适配 s_full 集成）。
 
-Provides directory-level isolation for parallel Git Worker subagents.
-Each worker gets its own worktree with an independent working directory,
-while sharing the same .git object store.
+为并行 Git Worker 子代理提供目录级隔离。
+每个 Worker 获得独立的 worktree 和工作目录，
+同时共享同一个 .git 对象存储。
 
     project/
       .worktrees/
-        wt-add-logging/     ← worker A's isolated workspace
-        wt-fix-auth/        ← worker B's isolated workspace
-      .worktrees/index.json ← lifecycle tracking
+        wt-add-logging/     ← Worker A 的隔离工作区
+        wt-fix-auth/        ← Worker B 的隔离工作区
+      .worktrees/index.json ← 生命周期追踪
 
-Usage:
+使用方式：
     wm = WorktreeManager()
-    wt = wm.create("feat-add-logging")   # creates worktree + branch
-    # ... do work in wt["path"] ...
+    wt = wm.create("feat-add-logging")   # 创建 worktree + 分支
+    # ... 在 wt["path"] 中工作 ...
     wm.merge_and_cleanup("feat-add-logging", target="main")
 """
 
@@ -24,14 +24,14 @@ import subprocess
 import time
 from pathlib import Path
 
-from .config import WORKDIR
+from ..core.config import WORKDIR
 
 WORKTREES_DIR = WORKDIR / ".worktrees"
 WORKTREES_INDEX = WORKTREES_DIR / "index.json"
 
 
-def _detect_repo_root(cwd: Path):  # -> Path | None (py3.9 compat)
-    """Return git repo root if cwd is inside a repo."""
+def _detect_repo_root(cwd: Path):  # -> Path | None（兼容 py3.9）
+    """如果 cwd 在 git 仓库内，返回仓库根目录。"""
     try:
         r = subprocess.run(
             ["git", "rev-parse", "--show-toplevel"],
@@ -49,7 +49,7 @@ REPO_ROOT = _detect_repo_root(WORKDIR) or WORKDIR
 
 
 class WorktreeManager:
-    """Manage git worktrees for isolated task execution."""
+    """管理 Git Worktree，用于隔离任务执行。"""
 
     def __init__(self):
         self.repo_root = REPO_ROOT
@@ -60,7 +60,7 @@ class WorktreeManager:
         self.git_ok = self._is_git_repo()
 
     # ------------------------------------------------------------------
-    # Internal helpers
+    # 内部辅助方法
     # ------------------------------------------------------------------
 
     def _init_index(self):
@@ -90,7 +90,7 @@ class WorktreeManager:
             return False
 
     def _git(self, *args: str, cwd=None, timeout: int = 60) -> subprocess.CompletedProcess:
-        """Run git command. Defaults to repo_root as cwd."""
+        """运行 git 命令。默认使用 repo_root 作为工作目录。"""
         return subprocess.run(
             ["git"] + list(args),
             cwd=cwd or self.repo_root,
@@ -99,8 +99,8 @@ class WorktreeManager:
 
     @staticmethod
     def _sanitize_name(raw: str) -> str:
-        """Convert task description into a safe worktree/branch name."""
-        # Take first 30 chars, replace non-alphanumeric with hyphens, collapse
+        """将任务描述转换为安全的 worktree/分支名。"""
+        # 取前40个字符，将非字母数字替换为连字符，合并重复连字符
         s = raw.strip().lower()[:40]
         s = re.sub(r"[^a-z0-9]", "-", s)
         s = re.sub(r"-{2,}", "-", s)
@@ -108,21 +108,21 @@ class WorktreeManager:
         return s or "unnamed"
 
     # ------------------------------------------------------------------
-    # Public API
+    # 公共 API
     # ------------------------------------------------------------------
 
     def create(self, task_description: str, base_ref: str = "HEAD") -> dict:
-        """Create a new worktree with a branch derived from base_ref.
+        """创建一个新的 worktree，并从 base_ref 派生分支。
 
-        Args:
-            task_description: Human-readable task (used to generate name).
-            base_ref: Git ref to base the branch on. Default HEAD.
+        参数:
+            task_description: 人类可读的任务描述（用于生成名称）。
+            base_ref: 作为分支基础的 Git 引用。默认为 HEAD。
 
-        Returns:
-            Dict with keys: name, path, branch, created_at.
+        返回:
+            包含以下键的字典: name, path, branch, created_at。
 
-        Raises:
-            RuntimeError: If git not available or worktree creation fails.
+        异常:
+            RuntimeError: 如果 git 不可用或 worktree 创建失败。
         """
         if not self.git_ok:
             raise RuntimeError(f"Not a git repo: {self.repo_root}")
@@ -132,7 +132,7 @@ class WorktreeManager:
         branch = f"wt/{safe_name}"
         path = self.dir / name
 
-        # Avoid collision - append number if needed
+        # 避免命名冲突 - 必要时追加数字
         idx = self._load_index()
         existing_names = {wt["name"] for wt in idx.get("worktrees", [])}
         if name in existing_names or path.exists():
@@ -144,7 +144,12 @@ class WorktreeManager:
                     path = self.dir / name
                     break
 
-        # Create the worktree + branch
+        # 清理残留：分支存在但 worktree 不存在，先删除孤立分支
+        r_check = self._git("branch", "--list", branch)
+        if branch in r_check.stdout and not path.exists():
+            self._git("branch", "-D", branch)
+
+        # 创建 worktree 和分支
         r = self._git("worktree", "add", "-b", branch, str(path), base_ref)
         if r.returncode != 0:
             raise RuntimeError(
@@ -166,15 +171,15 @@ class WorktreeManager:
         return entry
 
     def get(self, name: str):  # -> dict | None (py3.9 compat)
-        """Get worktree info by name."""
+        """按名称获取 worktree 信息。"""
         return self._find(name)
 
     def list_all(self) -> str:
-        """List all tracked worktrees."""
+        """列出所有已追踪的 worktree。"""
         idx = self._load_index()
         wts = idx.get("worktrees", [])
         if not wts:
-            return "No active worktrees."
+            return "没有活跃的 worktree。"
 
         lines = [f"{'Name':<28} {'Branch':<25} {'Status':<10} {'Task'}"]
         lines.append("-" * 90)
@@ -188,7 +193,7 @@ class WorktreeManager:
         return "\n".join(lines)
 
     def status(self, name: str) -> str:
-        """Show git status inside a worktree."""
+        """显示 worktree 内的 git 状态。"""
         wt = self._find(name)
         if not wt:
             return f"Error: Worktree '{name}' not found."
@@ -203,13 +208,13 @@ class WorktreeManager:
         return output or "(clean)"
 
     def run_in(self, name: str, command: str, timeout: int = 120) -> str:
-        """Run a shell command inside a specific worktree.
+        """在指定 worktree 内运行 shell 命令。
 
-        This is the key isolation primitive — all worker operations go through this.
+        这是关键的隔离原语——所有 Worker 操作都通过此方法执行。
         """
         dangerous = ["rm -rf /", "sudo", "shutdown", "reboot"]
         if any(d in command for d in dangerous):
-            return "Error: Dangerous command blocked"
+            return "错误：危险命令已被阻止"
 
         wt = self._find(name)
         if not wt:
@@ -229,24 +234,24 @@ class WorktreeManager:
             return f"Error: Timeout ({timeout}s)"
 
     def _get_conflicted_files(self) -> list:
-        """Return list of files with merge/rebase conflicts."""
+        """返回存在合并/rebase 冲突的文件列表。"""
         r = self._git("diff", "--name-only", "--diff-filter=U", timeout=10)
         if r.returncode == 0 and r.stdout.strip():
             return [f for f in r.stdout.strip().splitlines() if f]
         return []
 
     def _abort_merge_or_rebase(self):
-        """Abort any ongoing merge or rebase operation on repo_root."""
-        # Try abort merge first
+        """中止 repo_root 上正在进行的合并或 rebase 操作。"""
+        # 先尝试中止合并
         r = self._git("merge", "--abort", timeout=10)
         if r.returncode != 0:
-            # Maybe it's a rebase
+            # 可能是 rebase
             self._git("rebase", "--abort", timeout=10)
 
     def _rebase_onto_target(self, name: str, target: str, results: list) -> dict:
-        """Rebase worktree branch onto target. Returns status dict.
+        """将 worktree 分支 rebase 到目标分支上。返回状态字典。
 
-        Returns dict with keys:
+        返回字典包含以下键:
             success: bool
             has_conflicts: bool
             conflicted_files: list[str]
@@ -259,7 +264,7 @@ class WorktreeManager:
 
         branch = wt["branch"]
 
-        # First checkout the target branch on repo_root
+        # 先在 repo_root 上检出目标分支
         r = self._git("checkout", target, timeout=15)
         if r.returncode != 0:
             r2 = self._git("checkout", "master", timeout=15)
@@ -271,16 +276,16 @@ class WorktreeManager:
         else:
             results.append(f"Switched to '{target}'")
 
-        # Rebase the worktree branch onto target
-        r = self._git("rebase", branch, onto=target, timeout=60)
+        # 将 worktree 分支 rebase 到目标分支上
+        r = self._git("rebase", "--onto", target, "HEAD", branch, timeout=60)
         if r.returncode == 0:
-            # Success! The rebased commits are now on target.
-            # But we need to clean up — the original branch is orphaned.
+            # 成功！rebase 后的提交现在在目标分支上。
+            # 但需要清理——原分支已成为孤立分支。
             results.append(f"Rebased '{branch}' onto '{target}' successfully.")
             return {"success": True, "has_conflicts": False,
                     "conflicted_files": [], "message": "rebase ok"}
 
-        # Conflict during rebase
+        # rebase 过程中发生冲突
         conflicted = self._get_conflicted_files()
         results.append(
             f"REBASE CONFLICT in {len(conflicted)} file(s): {', '.join(conflicted)}"
@@ -292,7 +297,7 @@ class WorktreeManager:
         }
 
     def _continue_rebase(self) -> dict:
-        """Attempt 'git rebase --continue'. Returns status dict."""
+        """尝试执行 'git rebase --continue'。返回状态字典。"""
         r = self._git("rebase", "--continue", "--no-edit", timeout=30)
         if r.returncode == 0:
             return {"success": True, "has_conflicts": False,
@@ -306,28 +311,28 @@ class WorktreeManager:
         }
 
     def _resolve_file_in_repo_root(self, file_path: str, strategy: str = "ours") -> str:
-        """Resolve a conflicted file using the given strategy.
+        """使用指定策略解决冲突文件。
 
-        Args:
-            file_path: Relative path to the conflicted file.
-            strategy: 'ours' (keep incoming/worktree changes) or 'theirs' (keep existing).
+        参数:
+            file_path: 冲突文件的相对路径。
+            strategy: 'ours'（保留传入/worktree 的修改）或 'theirs'（保留已有的内容）。
         """
         full_path = self.repo_root / file_path
         if not full_path.exists():
             return f"File not found: {file_path}"
 
-        # git checkout --ours/--theirs <file>
+        # git checkout --ours/--theirs <文件>
         r = self._git("checkout", f"--{strategy}", "--", file_path, timeout=10)
         if r.returncode != 0:
             return f"Failed to resolve {file_path} with strategy={strategy}: {r.stderr.strip()}"
 
-        # Stage the resolved file
+        # 暂存已解决的文件
         self._git("add", file_path, timeout=10)
         return f"Resolved {file_path} using --{strategy} strategy"
 
     def get_file_conflict_content(self, file_path: str) -> str:
-        """Read a conflicted file's content including conflict markers.
-        Useful for the LLM to understand what conflicts look like.
+        """读取冲突文件的内容（包含冲突标记）。
+        供 LLM 理解冲突的具体内容。
         """
         full_path = self.repo_root / file_path
         if not full_path.exists():
@@ -338,9 +343,9 @@ class WorktreeManager:
             return f"Error reading file: {e}"
 
     def write_resolved_file(self, file_path: str, content: str) -> str:
-        """Write resolved content to a conflicted file (in repo_root).
+        """将解决后的内容写入冲突文件（在 repo_root 中）。
 
-        After writing, stages the file for rebase --continue.
+        写入后，暂存文件以便执行 rebase --continue。
         """
         full_path = self.repo_root / file_path
         try:
@@ -354,26 +359,26 @@ class WorktreeManager:
     def merge_to_main(self, name: str, target: str = "main",
                       cleanup: bool = True,
                       auto_resolve: bool = False) -> dict:
-        """Merge/rebase worktree's branch into target branch.
+        """将 worktree 的分支合并/rebase 到目标分支。
 
-        When auto_resolve=False (default for manual use):
-            Uses merge --no-ff, reports conflicts, does NOT auto-resolve.
-            Returns a simple string summary.
+        当 auto_resolve=False（手动使用的默认模式）时:
+            使用 merge --no-ff，报告冲突，不自动解决。
+            返回简单的字符串摘要。
 
-        When auto_resolve=True (used by Git Worker self-healing):
-            Uses rebase for cleaner history.
-            Returns a dict with detailed status so the worker can decide what to do.
+        当 auto_resolve=True（用于 Git Worker 自修复）时:
+            使用 rebase 以获得更干净的历史。
+            返回包含详细状态的字典，供 Worker 决定后续操作。
 
-        Workflow (auto_resolve mode):
-          1. Check worktree is clean
-          2. Rebase branch onto target
-          3. If conflict → return conflict details for worker to resolve
-          4. Worker resolves → call _continue_rebase()
-          5. Cleanup on success
+        工作流（auto_resolve 模式）:
+          1. 检查 worktree 是否干净
+          2. 将分支 rebase 到目标分支上
+          3. 如果有冲突 → 返回冲突详情供 Worker 解决
+          4. Worker 解决冲突 → 调用 _continue_rebase()
+          5. 成功后清理
 
-        Returns:
-            dict with keys: success, has_conflicts, conflicted_files,
-                           message, details (list of log lines)
+        返回:
+            包含以下键的字典: success, has_conflicts, conflicted_files,
+                           message, details（日志行列表）
         """
         wt = self._find(name)
         if not wt:
@@ -386,7 +391,7 @@ class WorktreeManager:
         branch = wt["branch"]
         results = []
 
-        # Step 1: Check worktree is clean
+        # 步骤1：检查 worktree 是否干净
         r = self._git("status", "--porcelain", cwd=path, timeout=10)
         if r.returncode == 0 and r.stdout.strip():
             results.append(
@@ -395,30 +400,30 @@ class WorktreeManager:
             )
 
         if not auto_resolve:
-            # Legacy merge mode (simple string result)
+            # 传统合并模式（返回简单字符串）
             return self._merge_simple(name, target, branch, results, cleanup)
 
-        # Auto-resolve mode: use rebase
+        # 自动解决模式：使用 rebase
         rebase_result = self._rebase_onto_target(name, target, results)
         rebase_result["details"] = results
 
         if rebase_result["success"]:
-            # Clean up on success
+            # 成功后清理
             if cleanup:
                 rm_result = self.remove(name, force=True)
                 results.append(rm_result)
             rebase_result["details"] = results
             return rebase_result
 
-        # Has conflicts — mark status, don't clean up
+        # 存在冲突——标记状态，不清理
         self._set_status(name, "conflict")
         rebase_result["details"] = results
         return rebase_result
 
     def _merge_simple(self, name: str, target: str, branch: str,
                        results: list, cleanup: bool) -> str:
-        """Simple merge (non-auto-resolve) returning a string."""
-        # Switch main to target branch
+        """简单合并（非自动解决），返回字符串。"""
+        # 将主工作区切换到目标分支
         r = self._git("checkout", target, timeout=15)
         if r.returncode != 0:
             r2 = self._git("checkout", "master", timeout=15)
@@ -429,7 +434,7 @@ class WorktreeManager:
         else:
             results.append(f"Switched to '{target}'")
 
-        # Merge
+        # 合并
         r = self._git("merge", "--no-ff", branch, "-m",
                        f"Merge {branch} into {target}", timeout=60)
         if r.returncode != 0:
@@ -455,7 +460,7 @@ class WorktreeManager:
         return "\n".join(results)
 
     def remove(self, name: str, force: bool = False) -> str:
-        """Remove a worktree and its branch."""
+        """移除 worktree 及其分支。"""
         wt = self._find(name)
         if not wt:
             return f"Error: Worktree '{name}' not found."
@@ -463,7 +468,7 @@ class WorktreeManager:
         path = Path(wt["path"])
         branch = wt.get("branch", "")
 
-        # Remove worktree
+        # 移除 worktree
         args = ["worktree", "remove"]
         if force:
             args.append("--force")
@@ -471,7 +476,7 @@ class WorktreeManager:
 
         r = self._git(*args, timeout=15)
         if r.returncode != 0:
-            # Try harder
+            # 尝试强制移除
             r2 = self._git("worktree", "remove", "--force", str(path), timeout=15)
             if r2.returncode != 0:
                 return (
@@ -481,11 +486,11 @@ class WorktreeManager:
                     f"Error: {r.stderr.strip()}"
                 )
 
-        # Delete the branch
+        # 删除分支
         if branch:
             self._git("branch", "-D", branch, timeout=10)
 
-        # Update index
+        # 更新索引
         idx = self._load_index()
         idx["worktrees"] = [
             w for w in idx["worktrees"] if w["name"] != name
@@ -495,7 +500,7 @@ class WorktreeManager:
         return f"Removed worktree '{name}' (branch: {branch})"
 
     def _set_status(self, name: str, status: str):
-        """Update worktree status in index."""
+        """更新索引中的 worktree 状态。"""
         idx = self._load_index()
         for wt in idx.get("worktrees", []):
             if wt["name"] == name:
@@ -504,13 +509,135 @@ class WorktreeManager:
         self._save_index(idx)
 
     def get_worktree_path(self, name: str):  # -> Path | None (py3.9 compat)
-        """Get the filesystem path of a worktree."""
+        """获取 worktree 的文件系统路径。"""
         wt = self._find(name)
         if wt:
             return Path(wt["path"])
         return None
 
 
-# Module-level singleton
+class WorktreePool:
+    """预分配的 worktree 池，支持动态伸缩。
+
+    与其为每个任务创建/销毁 worktree（开销大），
+    不如由该池维护一组可复用的 worktree。Worker 获取
+    worktree，完成工作，提交，然后归还给池。
+
+    池动态伸缩:
+      - 初始为空（或 min_size）
+      - 按需增长，上限为 max_size
+      - 空闲时收缩（通过 prune）
+
+    用法:
+        pool = WorktreePool(max_size=50)
+        wt = pool.acquire("task-description")  # 获取或创建
+        # ... 在 wt["path"] 中工作 ...
+        pool.release(wt["name"])              # 重置并归还到池
+        pool.prune()                          # 移除多余的空闲 worktree
+    """
+
+    def __init__(self, max_size: int = 50):
+        """初始化池。
+
+        参数:
+            max_size: worktree 最大数量（并行度上限）。
+        """
+        self._wm = WorktreeManager()  # 复用已有的管理器进行 git 操作
+        self.max_size = max_size
+        self._available = []   # 空闲 worktree 的名称列表
+        self._in_use = set()   # 当前已获取的 worktree 名称集合
+        self._counter = 0      # 用于生成唯一名称
+        # 不再预热，按需创建。每个 worktree 的分支名来自任务描述，有明确业务含义。
+
+    def _warm_up(self):
+        """已废弃：不再预热。worktree 按需创建，分支名由任务决定。"""
+
+    def _create_one(self, prefix: str = "_pool"):
+        """创建新的 worktree。返回名称或 None。"""
+        self._counter += 1
+        safe_name = f"{prefix}-{self._counter}"
+        try:
+            entry = self._wm.create(safe_name)
+            return entry["name"]
+        except Exception as e:
+            print(f"  [WorktreePool] Failed to create worktree: {e}")
+            return None
+
+    def acquire(self, task_hint: str) -> dict:
+        """为特定任务获取 worktree。
+
+        始终创建一个新的 worktree，分支名来自任务描述。
+        不使用池化/复用——每个任务获得独立的 worktree 和分支。
+
+        参数:
+            task_hint: 用于生成分支名的任务描述（必填）。
+
+        返回:
+            包含以下键的 worktree 字典: name, path, branch。
+        """
+        if not task_hint:
+            raise ValueError("acquire() 必须提供 task_hint（任务描述），用于生成有意义的分支名")
+
+        if len(self._in_use) >= self.max_size:
+            raise RuntimeError(
+                f"WorktreePool 已满 (max={self.max_size}, in_use={len(self._in_use)})"
+            )
+
+        name = self._create_one(task_hint)
+        if not name:
+            raise RuntimeError(f"Failed to create worktree for task: {task_hint}")
+
+        wt = self._wm.get(name)
+        if wt:
+            self._in_use.add(name)
+        return wt
+
+    def release(self, name: str):
+        """使用后释放并销毁 worktree。
+
+        由于每个 worktree 都有任务专属分支，释放时直接销毁，
+        而不是归还到池中。这样可以保持分支的语义明确性。
+        """
+        if name not in self._in_use:
+            return
+
+        try:
+            self._wm.remove(name, force=True)
+        except Exception as e:
+            print(f"  [WorktreePool] Warning: failed to remove {name}: {e}")
+
+        self._in_use.discard(name)
+
+    def prune(self):
+        """销毁所有空闲 worktree。由于不再使用池化，此方法为空操作。"""
+        pass
+
+    def stats(self) -> dict:
+        """返回池的统计信息。"""
+        return {
+            "in_use": len(self._in_use),
+            "max_size": self.max_size,
+        }
+
+    def cleanup_all(self):
+        """移除所有池中的 worktree。关闭时调用。"""
+        for name in list(self._available):
+            try:
+                self._wm.remove(name, force=True)
+            except Exception:
+                pass
+        for name in list(self._in_use):
+            try:
+                self._wm.remove(name, force=True)
+            except Exception:
+                pass
+        self._available.clear()
+        self._in_use.clear()
+
+
+# 模块级单例
 WORKTREES = WorktreeManager()
+
+# 模块级 worktree 池（用于高吞吐场景）
+WTPOOL = WorktreePool(max_size=50)
 

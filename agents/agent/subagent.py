@@ -15,9 +15,9 @@ Git Worker Self-Healing:
   - The worker NEVER gives up on its own bugs.
 """
 
-from .llm import call_llm, parse_llm_response
-from .tools import run_bash, run_read, run_write, run_edit
-from .worktree import WORKTREES
+from ..agent.worktree import WORKTREES
+from ..llm.llm import call_llm, parse_llm_response
+from ..tools.tools import run_bash, run_read, run_write, run_edit
 
 
 def run_subagent(prompt: str, agent_type: str = "Explore") -> str:

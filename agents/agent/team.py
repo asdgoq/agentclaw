@@ -5,11 +5,11 @@ import json
 import threading
 import time
 
-from .config import (WORKDIR, TEAM_DIR, TASKS_DIR, POLL_INTERVAL, IDLE_TIMEOUT)
-from .llm import call_llm, parse_llm_response
 from .messaging import MessageBus
-from .tasks import TaskManager
-from .tools import run_bash, run_read, run_write, run_edit
+from ..core.config import (WORKDIR, TEAM_DIR, TASKS_DIR, POLL_INTERVAL, IDLE_TIMEOUT)
+from ..data.tasks import TaskManager
+from ..llm.llm import call_llm, parse_llm_response
+from ..tools.tools import run_bash, run_read, run_write, run_edit
 
 
 class TeammateManager:
